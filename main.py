@@ -405,100 +405,315 @@ def query_option_b(graph):
 #
 #  pip install pyvis
 # ═══════════════════════════════════════════════════════════════════════
+# def visualize_graph(client, output_file="neptune_graph.html"):
+#     """
+#     Reads all nodes and relationships from Neptune and renders
+#     an interactive visual graph using PyVis.
+#     Saves output as an HTML file and opens it in the browser.
+
+#     Args:
+#         client      : boto3 neptunedata client
+#         output_file : name of the HTML file to save
+#     """
+#     from pyvis.network import Network
+
+#     print(f"\n[VISUALIZE] Building interactive graph → {output_file}...")
+
+#     # Colour per node label
+#     COLOUR_MAP = {
+#         "Patient":      "#4A90D9",
+#         "Doctor":       "#27AE60",
+#         "Hospital":     "#E67E22",
+#         "Claim":        "#E74C3C",
+#         "Diagnosis":    "#9B59B6",
+#         "Procedure":    "#F39C12",
+#         "Insurer":      "#1ABC9C",
+#         "Person":       "#4A90D9",
+#         "Organization": "#E67E22",
+#     }
+#     DEFAULT_COLOUR = "#95A5A6"
+
+#     # Fetch all nodes
+#     node_result = client.execute_open_cypher_query(
+#         openCypherQuery="MATCH (n) RETURN labels(n)[0] AS label, n AS node LIMIT 200"
+#     )
+#     # Fetch all relationships
+#     rel_result = client.execute_open_cypher_query(
+#         openCypherQuery="""
+#             MATCH (a)-[r]->(b)
+#             RETURN labels(a)[0] AS from_label, a AS from_node,
+#                    type(r)      AS rel_type,
+#                    labels(b)[0] AS to_label,   b AS to_node
+#             LIMIT 300
+#         """
+#     )
+
+#     # Build PyVis network
+#     net = Network(
+#         height    = "750px",
+#         width     = "100%",
+#         bgcolor   = "#1a1a2e",
+#         font_color= "white",
+#         notebook  = False
+#     )
+#     net.barnes_hut()    # physics layout — nodes naturally repel each other
+
+#     added_nodes = set()
+
+#     # Add nodes
+#     for row in node_result.get("results", []):
+#         label    = row.get("label", "Unknown")
+#         node_obj = row.get("node", {})
+#         if not isinstance(node_obj, dict):
+#             continue
+#         props    = {k: v for k, v in node_obj.items() if not k.startswith("~")}
+#         node_id  = str(props.get("id", list(props.values())[0] if props else id(node_obj)))
+#         tooltip  = "\n".join(f"{k}: {v}" for k, v in props.items())
+
+#         if node_id not in added_nodes:
+#             net.add_node(
+#                 node_id,
+#                 label = node_id,
+#                 title = tooltip,            # shown on hover
+#                 color = COLOUR_MAP.get(label, DEFAULT_COLOUR),
+#                 size  = 22,
+#                 font  = {"size": 13, "color": "white"}
+#             )
+#             added_nodes.add(node_id)
+
+#     # Add edges
+#     for row in rel_result.get("results", []):
+#         from_obj = row.get("from_node", {})
+#         to_obj   = row.get("to_node",   {})
+#         rel_type = row.get("rel_type",  "")
+#         if not isinstance(from_obj, dict) or not isinstance(to_obj, dict):
+#             continue
+#         from_props = {k: v for k, v in from_obj.items() if not k.startswith("~")}
+#         to_props   = {k: v for k, v in to_obj.items()   if not k.startswith("~")}
+#         from_id    = str(from_props.get("id", list(from_props.values())[0] if from_props else None))
+#         to_id      = str(to_props.get("id",   list(to_props.values())[0]   if to_props   else None))
+
+#         if from_id and to_id and from_id in added_nodes and to_id in added_nodes:
+#             net.add_edge(from_id, to_id, label=rel_type, color="#aaaaaa", arrows="to")
+
+#     net.save_graph(output_file)
+#     print(f"  ✅ Graph saved → {output_file}")
+#     print(f"  Opening in browser...")
+#     webbrowser.open(f"file://{os.path.abspath(output_file)}")
+
 def visualize_graph(client, output_file="neptune_graph.html"):
     """
-    Reads all nodes and relationships from Neptune and renders
-    an interactive visual graph using PyVis.
-    Saves output as an HTML file and opens it in the browser.
-
-    Args:
-        client      : boto3 neptunedata client
-        output_file : name of the HTML file to save
+    Generic interactive graph visualizer.
+    Works for ANY nodes and edges in Neptune — not hardcoded to any domain.
+    Auto-assigns colours dynamically based on whatever labels exist.
+    Saves as HTML and opens in browser.
     """
     from pyvis.network import Network
+    import hashlib
 
     print(f"\n[VISUALIZE] Building interactive graph → {output_file}...")
 
-    # Colour per node label
-    COLOUR_MAP = {
-        "Patient":      "#4A90D9",
-        "Doctor":       "#27AE60",
-        "Hospital":     "#E67E22",
-        "Claim":        "#E74C3C",
-        "Diagnosis":    "#9B59B6",
-        "Procedure":    "#F39C12",
-        "Insurer":      "#1ABC9C",
-        "Person":       "#4A90D9",
-        "Organization": "#E67E22",
-    }
-    DEFAULT_COLOUR = "#95A5A6"
-
-    # Fetch all nodes
+    # ── Step 1: Pull nodes with explicit property return ──────────────
+    # KEY FIX: Instead of returning the full node object (n),
+    # explicitly return labels and all properties as separate columns.
+    # Neptune's node object format varies — explicit columns are reliable.
     node_result = client.execute_open_cypher_query(
-        openCypherQuery="MATCH (n) RETURN labels(n)[0] AS label, n AS node LIMIT 200"
-    )
-    # Fetch all relationships
-    rel_result = client.execute_open_cypher_query(
         openCypherQuery="""
-            MATCH (a)-[r]->(b)
-            RETURN labels(a)[0] AS from_label, a AS from_node,
-                   type(r)      AS rel_type,
-                   labels(b)[0] AS to_label,   b AS to_node
+            MATCH (n)
+            RETURN labels(n)[0]  AS label,
+                   id(n)         AS node_id,
+                   keys(n)       AS prop_keys,
+                   n             AS node_obj
             LIMIT 300
         """
     )
 
-    # Build PyVis network
-    net = Network(
-        height    = "750px",
-        width     = "100%",
-        bgcolor   = "#1a1a2e",
-        font_color= "white",
-        notebook  = False
+    # ── Step 2: Pull relationships with explicit columns ───────────────
+    rel_result = client.execute_open_cypher_query(
+        openCypherQuery="""
+            MATCH (a)-[r]->(b)
+            RETURN id(a)    AS from_id,
+                   id(b)    AS to_id,
+                   type(r)  AS rel_type
+            LIMIT 500
+        """
     )
-    net.barnes_hut()    # physics layout — nodes naturally repel each other
 
-    added_nodes = set()
+    nodes_raw = node_result.get("results", [])
+    rels_raw  = rel_result.get("results",  [])
 
-    # Add nodes
-    for row in node_result.get("results", []):
+    print(f"  Raw nodes fetched : {len(nodes_raw)}")
+    print(f"  Raw rels fetched  : {len(rels_raw)}")
+
+    if not nodes_raw:
+        print("  ⚠️  No nodes found in Neptune. Load data first.")
+        return
+
+    # ── Step 3: Discover all unique labels and auto-assign colours ─────
+    # Generate a distinct colour for every label found in the graph.
+    # Uses a hash of the label name → consistent colour every run.
+    PALETTE = [
+        "#4A90D9", "#27AE60", "#E74C3C", "#F39C12", "#9B59B6",
+        "#1ABC9C", "#E67E22", "#2ECC71", "#3498DB", "#E91E63",
+        "#FF5722", "#607D8B", "#795548", "#009688", "#673AB7"
+    ]
+
+    all_labels   = list({row.get("label", "Unknown") for row in nodes_raw})
+    label_colour = {
+        label: PALETTE[i % len(PALETTE)]
+        for i, label in enumerate(sorted(all_labels))
+    }
+
+    print(f"  Labels found      : {all_labels}")
+    print(f"  Colour map        : {label_colour}")
+
+    # ── Step 4: Build a node_id → display info map ────────────────────
+    # node_id from id(n) is Neptune's internal element ID — reliable.
+    # We find the best display label from the node's own properties.
+    node_map = {}   # node_id → {label, display_name, tooltip, colour}
+
+    for row in nodes_raw:
         label    = row.get("label", "Unknown")
-        node_obj = row.get("node", {})
-        if not isinstance(node_obj, dict):
-            continue
-        props    = {k: v for k, v in node_obj.items() if not k.startswith("~")}
-        node_id  = str(props.get("id", list(props.values())[0] if props else id(node_obj)))
-        tooltip  = "\n".join(f"{k}: {v}" for k, v in props.items())
+        node_id  = str(row.get("node_id", ""))
+        node_obj = row.get("node_obj", {})
+        prop_keys = row.get("prop_keys", [])
 
-        if node_id not in added_nodes:
-            net.add_node(
-                node_id,
-                label = node_id,
-                title = tooltip,            # shown on hover
-                color = COLOUR_MAP.get(label, DEFAULT_COLOUR),
-                size  = 22,
-                font  = {"size": 13, "color": "white"}
+        if not node_id:
+            continue
+
+        # Extract all properties from the node object
+        props = {}
+        if isinstance(node_obj, dict):
+            props = {
+                k: v for k, v in node_obj.items()
+                if not k.startswith("~") and v is not None
+            }
+
+        # Pick the best human-readable display name from properties
+        # Priority: name > id > first string property > node_id
+        display_name = (
+            props.get("name")   or
+            props.get("id")     or
+            props.get("title")  or
+            next((str(v) for v in props.values() if isinstance(v, str)), None) or
+            f"{label}_{node_id}"
+        )
+
+        # Build tooltip: show label + all properties on hover
+        tooltip_lines = [f"Label: {label}"]
+        for k, v in props.items():
+            tooltip_lines.append(f"{k}: {v}")
+        tooltip = "\n".join(tooltip_lines)
+
+        node_map[node_id] = {
+            "label":        label,
+            "display_name": str(display_name),
+            "tooltip":      tooltip,
+            "colour":       label_colour.get(label, "#95A5A6")
+        }
+
+    # ── Step 5: Build PyVis network ───────────────────────────────────
+    net = Network(
+        height     = "800px",
+        width      = "100%",
+        bgcolor    = "#1a1a2e",
+        font_color = "white",
+        notebook   = False
+    )
+    # Barnes-hut physics: nodes repel, edges attract — clean auto-layout
+    net.barnes_hut(
+        gravity=-8000,
+        central_gravity=0.3,
+        spring_length=150,
+        spring_strength=0.05,
+        damping=0.9
+    )
+
+    # Add nodes to PyVis
+    added_node_ids = set()
+    for node_id, info in node_map.items():
+        net.add_node(
+            node_id,
+            label = info["display_name"],   # text shown ON the node
+            title = info["tooltip"],         # text shown on HOVER
+            color = info["colour"],
+            size  = 25,
+            font  = {"size": 14, "color": "white", "strokeWidth": 2, "strokeColor": "#000000"},
+            borderWidth = 2,
+            borderWidthSelected = 4
+        )
+        added_node_ids.add(node_id)
+
+    # Add edges to PyVis
+    edge_count = 0
+    for row in rels_raw:
+        from_id  = str(row.get("from_id", ""))
+        to_id    = str(row.get("to_id",   ""))
+        rel_type = str(row.get("rel_type",""))
+
+        if from_id in added_node_ids and to_id in added_node_ids:
+            net.add_edge(
+                from_id, to_id,
+                label  = rel_type,           # relationship name shown on edge
+                title  = rel_type,           # shown on hover
+                color  = {"color": "#aaaaaa", "highlight": "#ffffff"},
+                arrows = "to",
+                font   = {"size": 11, "color": "#dddddd", "strokeWidth": 0},
+                width  = 1.5
             )
-            added_nodes.add(node_id)
+            edge_count += 1
 
-    # Add edges
-    for row in rel_result.get("results", []):
-        from_obj = row.get("from_node", {})
-        to_obj   = row.get("to_node",   {})
-        rel_type = row.get("rel_type",  "")
-        if not isinstance(from_obj, dict) or not isinstance(to_obj, dict):
-            continue
-        from_props = {k: v for k, v in from_obj.items() if not k.startswith("~")}
-        to_props   = {k: v for k, v in to_obj.items()   if not k.startswith("~")}
-        from_id    = str(from_props.get("id", list(from_props.values())[0] if from_props else None))
-        to_id      = str(to_props.get("id",   list(to_props.values())[0]   if to_props   else None))
+    print(f"  Nodes added to graph : {len(added_node_ids)}")
+    print(f"  Edges added to graph : {edge_count}")
 
-        if from_id and to_id and from_id in added_nodes and to_id in added_nodes:
-            net.add_edge(from_id, to_id, label=rel_type, color="#aaaaaa", arrows="to")
+    # ── Step 6: Add legend for node labels ────────────────────────────
+    # Adds invisible legend nodes in the top-left so viewer knows
+    # which colour = which label
+    legend_x = -600
+    legend_y = -400
+    for i, (label, colour) in enumerate(label_colour.items()):
+        legend_id = f"__legend_{label}"
+        net.add_node(
+            legend_id,
+            label   = f"  {label}",
+            color   = colour,
+            size    = 15,
+            x       = legend_x,
+            y       = legend_y + (i * 50),
+            physics = False,          # legend nodes don't move
+            fixed   = True,
+            font    = {"size": 13, "color": "white"},
+            shape   = "dot",
+            title   = f"Node type: {label}"
+        )
 
+    # ── Step 7: Configure display options ─────────────────────────────
+    net.set_options("""
+    {
+      "nodes": {
+        "shape": "dot",
+        "scaling": { "min": 20, "max": 30 }
+      },
+      "edges": {
+        "smooth": { "type": "curvedCW", "roundness": 0.2 },
+        "font":   { "align": "middle" }
+      },
+      "interaction": {
+        "hover":          true,
+        "navigationButtons": true,
+        "keyboard":       true,
+        "tooltipDelay":   100
+      },
+      "physics": {
+        "enabled": true,
+        "stabilization": { "iterations": 150 }
+      }
+    }
+    """)
+
+    # ── Step 8: Save and open ─────────────────────────────────────────
     net.save_graph(output_file)
     print(f"  ✅ Graph saved → {output_file}")
-    print(f"  Opening in browser...")
     webbrowser.open(f"file://{os.path.abspath(output_file)}")
 
 
