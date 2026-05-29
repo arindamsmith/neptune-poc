@@ -640,8 +640,10 @@ def visualize_graph(client, output_file="neptune_graph.html"):
         openCypherQuery="""
             MATCH (n)
             RETURN labels(n)[0] AS label,
-                   id(n)        AS node_id,
-                   n            AS node_obj
+               id(n)        AS node_id,
+               n.id         AS id_prop,
+               n.name       AS name_prop,
+               n.title      AS title_prop
             LIMIT 300
         """
     )
@@ -680,43 +682,75 @@ def visualize_graph(client, output_file="neptune_graph.html"):
     # ── Build node map ────────────────────────────────────────────────
     node_map = {}
 
+    # for row in nodes_raw:
+    #     label    = row.get("label", "Unknown")
+    #     node_id  = str(row.get("node_id", ""))
+    #     node_obj = row.get("node_obj", {})
+    #     if not node_id:
+    #         continue
+
+    #     # Extract all properties cleanly
+    #     props = {
+    #         k: v for k, v in (node_obj if isinstance(node_obj, dict) else {}).items()
+    #         if not k.startswith("~") and v is not None
+    #     }
+
+    #     # ── FIX 2: Display NAME on the node, everything else on hover ─
+    #     # Priority for display label: name > title > id property > first string value
+    #     display_name = (
+    #         props.get("name")   or
+    #         props.get("title")  or
+    #         props.get("id")     or
+    #         next((str(v) for v in props.values() if isinstance(v, str)), None) or
+    #         f"{label}_{node_id}"
+    #     )
+
+    #     # Hover tooltip — shows ALL details including type and internal id
+    #     tooltip_lines = [
+    #         f"Type    : {label}",
+    #         f"Intern ID: {node_id}",
+    #         "─────────────────",
+    #     ]
+    #     for k, v in props.items():
+    #         tooltip_lines.append(f"{k}: {v}")
+    #     tooltip = "\n".join(tooltip_lines)
+
+    #     node_map[node_id] = {
+    #         "label":        label,
+    #         "display_name": str(display_name),   # human name on node
+    #         "tooltip":      tooltip,              # full detail on hover
+    #         "colour":       label_colour.get(label, "#95A5A6")
+    #     }
     for row in nodes_raw:
-        label    = row.get("label", "Unknown")
-        node_id  = str(row.get("node_id", ""))
-        node_obj = row.get("node_obj", {})
+        label      = row.get("label",      "Unknown")
+        node_id    = str(row.get("node_id", ""))
+        id_prop    = row.get("id_prop")          # value of n.id property
+        name_prop  = row.get("name_prop")        # value of n.name property
+        title_prop = row.get("title_prop")       # value of n.title property
+
         if not node_id:
             continue
 
-        # Extract all properties cleanly
-        props = {
-            k: v for k, v in (node_obj if isinstance(node_obj, dict) else {}).items()
-            if not k.startswith("~") and v is not None
-        }
-
-        # ── FIX 2: Display NAME on the node, everything else on hover ─
-        # Priority for display label: name > title > id property > first string value
+        # Display name — explicitly from queried columns, no object parsing
         display_name = (
-            props.get("name")   or
-            props.get("title")  or
-            props.get("id")     or
-            next((str(v) for v in props.values() if isinstance(v, str)), None) or
+            name_prop   or    # n.name  e.g. "Ravi Sharma"
+            title_prop  or    # n.title
+            id_prop     or    # n.id    e.g. "Alice" (set by LLMGraphTransformer)
             f"{label}_{node_id}"
         )
 
-        # Hover tooltip — shows ALL details including type and internal id
-        tooltip_lines = [
-            f"Type    : {label}",
-            f"Intern ID: {node_id}",
-            "─────────────────",
-        ]
-        for k, v in props.items():
-            tooltip_lines.append(f"{k}: {v}")
-        tooltip = "\n".join(tooltip_lines)
+        # Hover tooltip — type + id + all known properties
+        tooltip = "\n".join([
+            f"Type : {label}",
+            f"ID   : {node_id}",
+            f"name : {name_prop or '—'}",
+            f"id   : {id_prop   or '—'}",
+        ])
 
         node_map[node_id] = {
             "label":        label,
-            "display_name": str(display_name),   # human name on node
-            "tooltip":      tooltip,              # full detail on hover
+            "display_name": str(display_name),
+            "tooltip":      tooltip,
             "colour":       label_colour.get(label, "#95A5A6")
         }
 
@@ -851,8 +885,16 @@ def visualize_graph(client, output_file="neptune_graph.html"):
       },
       "physics": {
         "enabled": true,
+        "barnesHut": {
+          "gravitationalConstant": -25000,
+          "centralGravity":        0.05,
+          "springLength":          220,
+          "springConstant":        0.04,
+          "damping":               0.95,
+          "avoidOverlap":          1
+        },
         "stabilization": {
-          "enabled":   true,
+          "enabled":    true,
           "iterations": 300,
           "fit":        true
         }
@@ -860,8 +902,36 @@ def visualize_graph(client, output_file="neptune_graph.html"):
     }
     """)
 
+    # net.save_graph(output_file)
+    # print(f"  ✅ Saved → {output_file}")
+    # webbrowser.open(f"file://{os.path.abspath(output_file)}")
+
     net.save_graph(output_file)
-    print(f"  ✅ Saved → {output_file}")
+
+    # ── Inject JS: disable physics once stabilization completes ───────
+    # After the initial layout run, physics turns off automatically.
+    # Nodes then hold position when you drag them — they never snap back.
+    with open(output_file, "r") as f:
+        html = f.read()
+
+    freeze_script = """
+    <script>
+    window.addEventListener("load", function() {
+        network.on("stabilizationIterationsDone", function () {
+            network.setOptions({ physics: { enabled: false } });
+            console.log("Physics disabled — nodes are now frozen in place.");
+        });
+    });
+    </script>
+    """
+    # Inject just before closing </body> tag
+    html = html.replace("</body>", freeze_script + "</body>")
+
+    with open(output_file, "w") as f:
+        f.write(html)
+
+    print(f"   Saved → {output_file}")
+    print(f"   Nodes will auto-freeze after initial layout. Drag freely.")
     webbrowser.open(f"file://{os.path.abspath(output_file)}")
 
 # ═══════════════════════════════════════════════════════════════════════
