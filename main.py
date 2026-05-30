@@ -1087,152 +1087,161 @@ def get_nlp_query_chain(graph):
     # ─────────────────────────────────────────────────────────────────
     CYPHER_GENERATION_TEMPLATE = """
 You are an expert openCypher query generator for Amazon Neptune graph database.
-Your job is to convert a user's natural language question into a precise
-openCypher query using the provided graph schema.
+Convert the user's natural language question into a valid Neptune openCypher query.
 
 Graph Schema:
 {schema}
 
 ════════════════════════════════════════════════════════
-MANDATORY RULES — apply ALL of these to every query:
+NEPTUNE-SPECIFIC RULES — STRICTLY FOLLOW THESE:
 ════════════════════════════════════════════════════════
 
-RULE 1 — ALWAYS USE CASE-INSENSITIVE FUZZY MATCHING FOR ANY ENTITY NAME
-  Never use exact property match like {{id: 'Alice'}} or {{name: 'Bob'}}.
-  Always use toLower() + CONTAINS pattern:
-    WHERE toLower(coalesce(n.id,'')) CONTAINS toLower('search_term')
+RULE 1 — NEVER USE coalesce() IN A WHERE CLAUSE
+  Neptune does NOT support coalesce() inside WHERE filters.
+  This is INVALID and will throw MalformedQueryException:
+    WHERE toLower(coalesce(n.id,'')) CONTAINS toLower('alice')  ← WRONG
 
-RULE 2 — ALWAYS SEARCH ACROSS MULTIPLE PROPERTY NAMES
-  Nodes may store the display value under different property names
-  depending on how the data was loaded (id, name, title, description etc).
-  Always search across all common property fields using OR:
-    WHERE toLower(coalesce(n.id,''))          CONTAINS toLower('term')
-       OR toLower(coalesce(n.name,''))        CONTAINS toLower('term')
-       OR toLower(coalesce(n.title,''))       CONTAINS toLower('term')
-       OR toLower(coalesce(n.description,'')) CONTAINS toLower('term')
+  Instead use direct OR conditions on individual properties:
+    WHERE toLower(n.id) CONTAINS toLower('alice')
+       OR toLower(n.name) CONTAINS toLower('alice')             ← CORRECT
 
-RULE 3 — USE UNDIRECTED RELATIONSHIPS UNLESS DIRECTION IS CERTAIN
-  Use (a)-[r]-(b) without arrow direction unless you are 100% sure
-  of the direction from the schema. This catches both directions.
+RULE 2 — ALWAYS USE toLower() ON BOTH SIDES FOR CASE-INSENSITIVE MATCH
+  WHERE toLower(n.id) CONTAINS toLower('search_term')
+  This handles: 'alice', 'Alice', 'ALICE' — all match correctly.
 
-RULE 4 — USE OPTIONAL MATCH FOR RELATIONSHIP TRAVERSALS
-  Wrap relationship patterns in OPTIONAL MATCH so partial data
-  still returns results instead of an empty list.
+RULE 3 — SEARCH ACROSS MULTIPLE PROPERTIES USING OR
+  Nodes may store the display value under id, name, or title.
+  Always check all using separate OR conditions:
+    WHERE toLower(n.id)    CONTAINS toLower('term')
+       OR toLower(n.name)  CONTAINS toLower('term')
+       OR toLower(n.title) CONTAINS toLower('term')
 
-RULE 5 — ALWAYS RETURN PROPERTY VALUES, NEVER RAW NODE OBJECTS
-  Bad  : RETURN n
-  Good : RETURN coalesce(n.name, n.id, n.title) AS Name
+RULE 4 — USE UNDIRECTED RELATIONSHIPS (no arrow)
+  Use (a)-[r]-(b) not (a)-[r]->(b) unless direction is 100% certain.
+  This handles reverse relationships automatically.
 
-RULE 6 — INFER RELATIONSHIP TYPE FROM QUESTION WHEN NOT EXPLICIT
-  If the user does not name a relationship type, infer it from context
-  and use toLower(type(r)) CONTAINS pattern to match it loosely:
-    WHERE toLower(type(r)) CONTAINS toLower('inferred_keyword')
-  If relationship is completely unknown, omit the relationship filter
-  and return all connected nodes.
+RULE 5 — USE OPTIONAL MATCH FOR RELATIONSHIP TRAVERSALS
+  OPTIONAL MATCH (a)-[r]-(b) ensures partial data returns results
+  instead of an empty list.
 
-RULE 7 — HANDLE AGGREGATE QUESTIONS
-  Questions with "how many", "total", "sum", "average", "most", "highest",
-  "lowest" need aggregation functions:
-    count(), sum(), avg(), max(), min()
-  Always use WITH for intermediate aggregation before RETURN.
+RULE 6 — RETURN PROPERTY VALUES NOT NODE OBJECTS
+  WRONG : RETURN n
+  CORRECT: RETURN n.id AS Name, n.name AS Name, labels(n)[0] AS Type
 
-RULE 8 — HANDLE LIST / OVERVIEW QUESTIONS
-  Questions like "show all", "list all", "what are all" should return
-  all matching nodes/relationships with LIMIT 50.
+RULE 7 — coalesce() IS ONLY VALID IN RETURN CLAUSE
+  coalesce() works fine in RETURN but NOT in WHERE.
+  VALID  : RETURN coalesce(n.name, n.id) AS DisplayName
+  INVALID: WHERE coalesce(n.id,'') CONTAINS 'alice'
 
-RULE 9 — ALWAYS INCLUDE LIMIT
-  Every query must end with LIMIT 50 unless the question asks for
-  a specific count or aggregation.
+RULE 8 — INFER RELATIONSHIP FROM QUESTION CONTEXT
+  If the user does not name a relationship, infer from keywords:
+  'friend/friends' → FRIENDS_WITH or FRIEND
+  'work/works at' → WORKS_AT or EMPLOYED_BY
+  'like/likes'    → LIKES
+  'treat/treated' → TREATED_BY or TREATS
+  'filed/claim'   → FILED
+  'diagnose'      → DIAGNOSED_WITH or HAS_DIAGNOSIS
+  Use: toLower(type(r)) CONTAINS toLower('inferred_keyword')
+  Or omit relationship filter entirely and return all connections.
 
-RULE 10 — RETURN MEANINGFUL COLUMN ALIASES
-  Always alias every returned column with AS and a descriptive name.
-  Bad  : RETURN a.id, type(r), b.id
-  Good : RETURN a.id AS From, type(r) AS Relationship, b.id AS To
+RULE 9 — ALWAYS ADD LIMIT 50
+
+RULE 10 — ALWAYS ALIAS EVERY RETURN COLUMN WITH AS
 
 ════════════════════════════════════════════════════════
-QUERY PATTERNS — use these as reference:
+CORRECT QUERY PATTERNS FOR NEPTUNE:
 ════════════════════════════════════════════════════════
 
-PATTERN A — Find a specific entity:
+PATTERN A — Find a specific entity by name (MOST COMMON):
   MATCH (n)
-  WHERE toLower(coalesce(n.id,''))   CONTAINS toLower('search_term')
-     OR toLower(coalesce(n.name,'')) CONTAINS toLower('search_term')
+  WHERE toLower(n.id)    CONTAINS toLower('alice')
+     OR toLower(n.name)  CONTAINS toLower('alice')
   RETURN labels(n)[0] AS Type,
-         coalesce(n.name, n.id, n.title) AS Name
+         n.id           AS ID,
+         n.name         AS Name
   LIMIT 50
 
-PATTERN B — Find all connections of an entity:
+PATTERN B — Find ALL connections of an entity:
   MATCH (a)
-  WHERE toLower(coalesce(a.id,''))   CONTAINS toLower('entity_name')
-     OR toLower(coalesce(a.name,'')) CONTAINS toLower('entity_name')
+  WHERE toLower(a.id)   CONTAINS toLower('alice')
+     OR toLower(a.name) CONTAINS toLower('alice')
   OPTIONAL MATCH (a)-[r]-(b)
-  RETURN coalesce(a.name, a.id)  AS Entity,
-         type(r)                  AS Relationship,
-         coalesce(b.name, b.id)   AS ConnectedTo,
-         labels(b)[0]             AS ConnectedType
+  RETURN a.id            AS Entity,
+         type(r)          AS Relationship,
+         b.id             AS ConnectedTo,
+         labels(b)[0]     AS ConnectedType
   LIMIT 50
 
-PATTERN C — Find relationship between two specific entities:
+PATTERN C — Find relationship between TWO specific entities:
   MATCH (a)
-  WHERE toLower(coalesce(a.id,''))   CONTAINS toLower('entity_one')
-     OR toLower(coalesce(a.name,'')) CONTAINS toLower('entity_one')
+  WHERE toLower(a.id)   CONTAINS toLower('entity_one')
+     OR toLower(a.name) CONTAINS toLower('entity_one')
   OPTIONAL MATCH (a)-[r]-(b)
-  WHERE toLower(coalesce(b.id,''))   CONTAINS toLower('entity_two')
-     OR toLower(coalesce(b.name,'')) CONTAINS toLower('entity_two')
-  RETURN coalesce(a.name, a.id) AS From,
-         type(r)                 AS Relationship,
-         coalesce(b.name, b.id)  AS To
+  WHERE toLower(b.id)   CONTAINS toLower('entity_two')
+     OR toLower(b.name) CONTAINS toLower('entity_two')
+  RETURN a.id   AS From,
+         type(r) AS Relationship,
+         b.id    AS To
   LIMIT 50
 
-PATTERN D — Find entities by relationship type:
+PATTERN D — Find by relationship type keyword:
   MATCH (a)-[r]-(b)
   WHERE toLower(type(r)) CONTAINS toLower('relationship_keyword')
-  RETURN coalesce(a.name, a.id) AS From,
-         type(r)                 AS Relationship,
-         coalesce(b.name, b.id)  AS To
+  RETURN a.id   AS From,
+         type(r) AS Relationship,
+         b.id    AS To
   LIMIT 50
 
-PATTERN E — Aggregate / count query:
-  MATCH (a)-[r]-(b)
-  WHERE toLower(coalesce(a.id,''))   CONTAINS toLower('entity_name')
-     OR toLower(coalesce(a.name,'')) CONTAINS toLower('entity_name')
-  WITH a, type(r) AS relType, count(b) AS total
-  RETURN coalesce(a.name, a.id) AS Entity,
-         relType                 AS Relationship,
-         total                   AS Count
-  ORDER BY total DESC
+PATTERN E — Find entity connections filtered by relationship keyword:
+  MATCH (a)
+  WHERE toLower(a.id)   CONTAINS toLower('entity_name')
+     OR toLower(a.name) CONTAINS toLower('entity_name')
+  OPTIONAL MATCH (a)-[r]-(b)
+  WHERE toLower(type(r)) CONTAINS toLower('relationship_keyword')
+  RETURN a.id    AS Entity,
+         type(r)  AS Relationship,
+         b.id     AS ConnectedTo
   LIMIT 50
 
 PATTERN F — List all nodes of a type:
   MATCH (n:NodeLabel)
-  RETURN coalesce(n.name, n.id, n.title) AS Name,
-         labels(n)[0] AS Type
-  ORDER BY Name
+  RETURN n.id           AS ID,
+         n.name         AS Name,
+         labels(n)[0]   AS Type
+  ORDER BY n.id
   LIMIT 50
 
-PATTERN G — Overview of entire graph:
+PATTERN G — Count / aggregate query:
   MATCH (a)-[r]-(b)
-  RETURN labels(a)[0]             AS FromType,
-         coalesce(a.name, a.id)   AS From,
-         type(r)                   AS Relationship,
-         labels(b)[0]             AS ToType,
-         coalesce(b.name, b.id)   AS To
+  WHERE toLower(a.id)   CONTAINS toLower('entity_name')
+     OR toLower(a.name) CONTAINS toLower('entity_name')
+  RETURN a.id          AS Entity,
+         type(r)        AS Relationship,
+         count(b)       AS Count
+  ORDER BY Count DESC
+  LIMIT 50
+
+PATTERN H — Full graph overview:
+  MATCH (a)-[r]-(b)
+  RETURN labels(a)[0] AS FromType,
+         a.id          AS From,
+         type(r)       AS Relationship,
+         labels(b)[0]  AS ToType,
+         b.id          AS To
   LIMIT 50
 
 ════════════════════════════════════════════════════════
-THINK STEP BY STEP before writing the query:
-  1. What entities is the user asking about?
-  2. What relationship or property are they asking about?
-  3. Is there aggregation needed (count, sum, highest, etc.)?
-  4. Which PATTERN above best fits the question?
-  5. Apply ALL mandatory rules to the chosen pattern.
+THINK STEP BY STEP:
+  1. Identify entity names in the question
+  2. Identify what relationship or property is being asked
+  3. Is aggregation needed? (how many, total, highest, most)
+  4. Pick the matching PATTERN above
+  5. Apply ALL rules — especially RULE 1 (no coalesce in WHERE)
 ════════════════════════════════════════════════════════
 
 Question: {question}
 
-openCypher Query:
-
-"""
+openCypher Query:"""
 
     cypher_prompt = PromptTemplate(
         input_variables = ["schema", "question"],
