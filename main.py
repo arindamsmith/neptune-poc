@@ -1040,6 +1040,240 @@ def verify(client):
         print(f"    {row.get('Relationship','?'):<25}: {row.get('Count',0)}")
 
 
+def get_nlp_query_chain(graph):
+    """
+    Builds and returns a reusable NeptuneOpenCypherQAChain with a
+    generic, foolproof custom prompt.
+
+    Handles ANY graph content — medical, claims, social, financial, etc.
+    Tolerates spelling mistakes, case differences, partial names,
+    implicit relationships, and reverse relationship directions.
+
+    Args:
+        graph : NeptuneGraph object from connect_option_b()
+
+    Returns:
+        chain : invoke with chain.invoke({"query": "your question"})
+
+    Usage:
+        chain  = get_nlp_query_chain(graph)
+        result = chain.invoke({"query": "What does Alice like?"})
+        print(result["result"])
+    """
+    from langchain_aws import ChatBedrock
+    from langchain.prompts import PromptTemplate
+    from langchain_community.chains.graph_qa.neptune_cypher import (
+        create_neptune_opencypher_qa_chain
+    )
+
+    llm = ChatBedrock(
+        model_id    = config.BEDROCK_MODEL_ID,
+        region_name = config.AWS_REGION
+    )
+
+    # ─────────────────────────────────────────────────────────────────
+    # GENERIC FOOLPROOF CYPHER GENERATION PROMPT
+    #
+    # Designed to handle:
+    #   - Any node types and relationship types (not hardcoded to domain)
+    #   - Case insensitivity  : "bob" matches "Bob", "BOB"
+    #   - Spelling tolerance  : CONTAINS instead of exact match
+    #   - Property ambiguity  : searches id, name, title, description
+    #   - Implicit questions  : "what does X like?" infers relationship
+    #   - Reverse direction   : undirected match catches both directions
+    #   - Missing data        : OPTIONAL MATCH avoids empty results
+    #   - Aggregation queries : count, sum, avg, max, min
+    #   - List queries        : "show all", "list all" type questions
+    # ─────────────────────────────────────────────────────────────────
+    CYPHER_GENERATION_TEMPLATE = """
+You are an expert openCypher query generator for Amazon Neptune graph database.
+Your job is to convert a user's natural language question into a precise
+openCypher query using the provided graph schema.
+
+Graph Schema:
+{schema}
+
+════════════════════════════════════════════════════════
+MANDATORY RULES — apply ALL of these to every query:
+════════════════════════════════════════════════════════
+
+RULE 1 — ALWAYS USE CASE-INSENSITIVE FUZZY MATCHING FOR ANY ENTITY NAME
+  Never use exact property match like {{id: 'Alice'}} or {{name: 'Bob'}}.
+  Always use toLower() + CONTAINS pattern:
+    WHERE toLower(coalesce(n.id,'')) CONTAINS toLower('search_term')
+
+RULE 2 — ALWAYS SEARCH ACROSS MULTIPLE PROPERTY NAMES
+  Nodes may store the display value under different property names
+  depending on how the data was loaded (id, name, title, description etc).
+  Always search across all common property fields using OR:
+    WHERE toLower(coalesce(n.id,''))          CONTAINS toLower('term')
+       OR toLower(coalesce(n.name,''))        CONTAINS toLower('term')
+       OR toLower(coalesce(n.title,''))       CONTAINS toLower('term')
+       OR toLower(coalesce(n.description,'')) CONTAINS toLower('term')
+
+RULE 3 — USE UNDIRECTED RELATIONSHIPS UNLESS DIRECTION IS CERTAIN
+  Use (a)-[r]-(b) without arrow direction unless you are 100% sure
+  of the direction from the schema. This catches both directions.
+
+RULE 4 — USE OPTIONAL MATCH FOR RELATIONSHIP TRAVERSALS
+  Wrap relationship patterns in OPTIONAL MATCH so partial data
+  still returns results instead of an empty list.
+
+RULE 5 — ALWAYS RETURN PROPERTY VALUES, NEVER RAW NODE OBJECTS
+  Bad  : RETURN n
+  Good : RETURN coalesce(n.name, n.id, n.title) AS Name
+
+RULE 6 — INFER RELATIONSHIP TYPE FROM QUESTION WHEN NOT EXPLICIT
+  If the user does not name a relationship type, infer it from context
+  and use toLower(type(r)) CONTAINS pattern to match it loosely:
+    WHERE toLower(type(r)) CONTAINS toLower('inferred_keyword')
+  If relationship is completely unknown, omit the relationship filter
+  and return all connected nodes.
+
+RULE 7 — HANDLE AGGREGATE QUESTIONS
+  Questions with "how many", "total", "sum", "average", "most", "highest",
+  "lowest" need aggregation functions:
+    count(), sum(), avg(), max(), min()
+  Always use WITH for intermediate aggregation before RETURN.
+
+RULE 8 — HANDLE LIST / OVERVIEW QUESTIONS
+  Questions like "show all", "list all", "what are all" should return
+  all matching nodes/relationships with LIMIT 50.
+
+RULE 9 — ALWAYS INCLUDE LIMIT
+  Every query must end with LIMIT 50 unless the question asks for
+  a specific count or aggregation.
+
+RULE 10 — RETURN MEANINGFUL COLUMN ALIASES
+  Always alias every returned column with AS and a descriptive name.
+  Bad  : RETURN a.id, type(r), b.id
+  Good : RETURN a.id AS From, type(r) AS Relationship, b.id AS To
+
+════════════════════════════════════════════════════════
+QUERY PATTERNS — use these as reference:
+════════════════════════════════════════════════════════
+
+PATTERN A — Find a specific entity:
+  MATCH (n)
+  WHERE toLower(coalesce(n.id,''))   CONTAINS toLower('search_term')
+     OR toLower(coalesce(n.name,'')) CONTAINS toLower('search_term')
+  RETURN labels(n)[0] AS Type,
+         coalesce(n.name, n.id, n.title) AS Name
+  LIMIT 50
+
+PATTERN B — Find all connections of an entity:
+  MATCH (a)
+  WHERE toLower(coalesce(a.id,''))   CONTAINS toLower('entity_name')
+     OR toLower(coalesce(a.name,'')) CONTAINS toLower('entity_name')
+  OPTIONAL MATCH (a)-[r]-(b)
+  RETURN coalesce(a.name, a.id)  AS Entity,
+         type(r)                  AS Relationship,
+         coalesce(b.name, b.id)   AS ConnectedTo,
+         labels(b)[0]             AS ConnectedType
+  LIMIT 50
+
+PATTERN C — Find relationship between two specific entities:
+  MATCH (a)
+  WHERE toLower(coalesce(a.id,''))   CONTAINS toLower('entity_one')
+     OR toLower(coalesce(a.name,'')) CONTAINS toLower('entity_one')
+  OPTIONAL MATCH (a)-[r]-(b)
+  WHERE toLower(coalesce(b.id,''))   CONTAINS toLower('entity_two')
+     OR toLower(coalesce(b.name,'')) CONTAINS toLower('entity_two')
+  RETURN coalesce(a.name, a.id) AS From,
+         type(r)                 AS Relationship,
+         coalesce(b.name, b.id)  AS To
+  LIMIT 50
+
+PATTERN D — Find entities by relationship type:
+  MATCH (a)-[r]-(b)
+  WHERE toLower(type(r)) CONTAINS toLower('relationship_keyword')
+  RETURN coalesce(a.name, a.id) AS From,
+         type(r)                 AS Relationship,
+         coalesce(b.name, b.id)  AS To
+  LIMIT 50
+
+PATTERN E — Aggregate / count query:
+  MATCH (a)-[r]-(b)
+  WHERE toLower(coalesce(a.id,''))   CONTAINS toLower('entity_name')
+     OR toLower(coalesce(a.name,'')) CONTAINS toLower('entity_name')
+  WITH a, type(r) AS relType, count(b) AS total
+  RETURN coalesce(a.name, a.id) AS Entity,
+         relType                 AS Relationship,
+         total                   AS Count
+  ORDER BY total DESC
+  LIMIT 50
+
+PATTERN F — List all nodes of a type:
+  MATCH (n:NodeLabel)
+  RETURN coalesce(n.name, n.id, n.title) AS Name,
+         labels(n)[0] AS Type
+  ORDER BY Name
+  LIMIT 50
+
+PATTERN G — Overview of entire graph:
+  MATCH (a)-[r]-(b)
+  RETURN labels(a)[0]             AS FromType,
+         coalesce(a.name, a.id)   AS From,
+         type(r)                   AS Relationship,
+         labels(b)[0]             AS ToType,
+         coalesce(b.name, b.id)   AS To
+  LIMIT 50
+
+════════════════════════════════════════════════════════
+THINK STEP BY STEP before writing the query:
+  1. What entities is the user asking about?
+  2. What relationship or property are they asking about?
+  3. Is there aggregation needed (count, sum, highest, etc.)?
+  4. Which PATTERN above best fits the question?
+  5. Apply ALL mandatory rules to the chosen pattern.
+════════════════════════════════════════════════════════
+
+Question: {question}
+
+openCypher Query:
+
+"""
+
+    cypher_prompt = PromptTemplate(
+        input_variables = ["schema", "question"],
+        template        = CYPHER_GENERATION_TEMPLATE
+    )
+
+    chain = create_neptune_opencypher_qa_chain(
+        llm                       = llm,
+        graph                     = graph,
+        cypher_prompt             = cypher_prompt,
+        return_intermediate_steps = True,
+        verbose                   = True
+    )
+
+    print("✅ NLP Query Chain ready.")
+    return chain
+
+# Build the chain once — reuse it for all questions
+chain = get_nlp_query_chain(graph_b)
+
+# Invoke for any question
+def ask(chain, question: str):
+    print(f"\n❓ {question}")
+    response = chain.invoke({"query": question})
+    print(f"💬 {response['result']}")
+
+    if "intermediate_steps" in response:
+        for step in response["intermediate_steps"]:
+            if "query" in step:
+                print(f"🔍 {step['query'].strip()}")
+    return response["result"]
+
+# Use anywhere
+ask(chain, "What does Alice like?")
+ask(chain, "where does bob work")
+ask(chain, "Which claims are under review?")
+ask(chain, "Who treated Ravi Sharma?")
+ask(chain, "What is the total claim amount for all approved claims?")
+ask(chain, "Which hospital has the most patients?")
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  SECTION 7 — CLEAN (wipe all data — use to reset between test runs)
 # ═══════════════════════════════════════════════════════════════════════
