@@ -1283,6 +1283,305 @@ ask(chain, "What is the total claim amount for all approved claims?")
 ask(chain, "Which hospital has the most patients?")
 
 
+import re
+from langchain_aws import ChatBedrock
+from langchain.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# NLP QUERY — SEQUENTIAL FUNCTIONS
+# Call order: get_llm → get_schema → generate_cypher → clean_cypher
+#             → run_neptune_query → generate_answer → ask
+# ═══════════════════════════════════════════════════════════════════════
+
+def get_llm():
+    """
+    Initialises and returns the Bedrock LLM.
+    Call once and reuse for both generate_cypher and generate_answer.
+    """
+    llm = ChatBedrock(
+        model_id    = config.BEDROCK_MODEL_ID,
+        region_name = config.AWS_REGION
+    )
+    print("✅ LLM initialised.")
+    return llm
+
+
+def get_schema(graph):
+    """
+    Reads and returns the graph schema from Neptune.
+    NeptuneGraph auto-discovers all node labels and relationship types
+    on connect. The LLM uses this schema to write correct Cypher queries.
+    """
+    schema = graph.get_schema
+    print(f"✅ Schema loaded:\n{schema}")
+    return schema
+
+
+def generate_cypher(llm, schema, question):
+    """
+    Step 1 — LLM reads schema + question and generates an openCypher query.
+    Output is raw LLM text — may contain markdown fences or reasoning text.
+    QueryGuard (clean_cypher) will fix it before Neptune sees it.
+
+    Args:
+        llm      : ChatBedrock instance from get_llm()
+        schema   : graph schema string from get_schema()
+        question : plain English question from user
+
+    Returns:
+        str : raw LLM output containing the generated Cypher
+    """
+    CYPHER_PROMPT = PromptTemplate(
+        input_variables=["schema", "question"],
+        template="""You are an openCypher expert for Amazon Neptune.
+Generate ONE openCypher query for the question below.
+
+Schema:
+{schema}
+
+RULES:
+1. Use ONE flat MATCH clause only — never split into two MATCH clauses
+2. Put ALL conditions in ONE WHERE block
+3. Never use OPTIONAL MATCH
+4. Use undirected relationship: (a)-[r]-(b)
+5. Case-insensitive: toLower(n.id) CONTAINS toLower('term')
+6. Search both id and name: toLower(n.id) CONTAINS toLower('x') OR toLower(n.name) CONTAINS toLower('x')
+7. No spaces inside functions: toLower() not to Lower() and not toLower ()
+8. RETURN property values not node objects: RETURN n.id not RETURN n
+9. End with LIMIT 50
+10. Output ONLY the raw Cypher — no explanation, no markdown, no commentary
+
+CORRECT example for "what does alice like":
+MATCH (a)-[r]-(b)
+WHERE (toLower(a.id) CONTAINS toLower('alice') OR toLower(a.name) CONTAINS toLower('alice'))
+AND toLower(type(r)) CONTAINS toLower('like')
+RETURN a.id AS Person, type(r) AS Relationship, b.id AS What
+LIMIT 50
+
+CORRECT example for "who is alice friend":
+MATCH (a)-[r]-(b)
+WHERE (toLower(a.id) CONTAINS toLower('alice') OR toLower(a.name) CONTAINS toLower('alice'))
+AND toLower(type(r)) CONTAINS toLower('friend')
+RETURN a.id AS From, type(r) AS Relationship, b.id AS Friend
+LIMIT 50
+
+CORRECT example for "show all patients":
+MATCH (n:Patient)
+RETURN n.id AS ID, n.name AS Name
+LIMIT 50
+
+Question: {question}
+Cypher Query:"""
+    )
+
+    chain      = CYPHER_PROMPT | llm | StrOutputParser()
+    raw_query  = chain.invoke({"schema": schema, "question": question})
+    print(f"\n🤖 RAW LLM OUTPUT:\n{raw_query}")
+    return raw_query
+
+
+def clean_cypher(raw_query):
+    """
+    Step 2 — QueryGuard: cleans the LLM-generated Cypher before Neptune sees it.
+
+    Fixes these known LLM failure patterns:
+      a) Strips markdown fences and reasoning text — extracts only Cypher
+      b) Fixes spaces inside function calls: to Lower() → toLower()
+      c) Replaces OPTIONAL MATCH with plain MATCH
+      d) Merges two MATCH blocks into one flat MATCH — the core fix
+
+    The LLM always generates a 2-block pattern:
+        MATCH (a)                     ← block 1: find entity
+        WHERE condition1
+        OPTIONAL MATCH (a)-[r]-(b)   ← block 2: follow relationship
+        WHERE condition2
+
+    Neptune only accepts one flat MATCH:
+        MATCH (a)-[r]-(b)
+        WHERE condition1
+        AND condition2
+
+    Args:
+        raw_query : raw LLM output string from generate_cypher()
+
+    Returns:
+        str : clean, Neptune-safe Cypher query
+    """
+
+    # ── a) Extract Cypher — strip markdown and reasoning text ─────────
+    match = re.search(r'```(?:cypher)?\s*(.*?)```', raw_query, re.DOTALL | re.IGNORECASE)
+    if match:
+        query = match.group(1).strip()
+    else:
+        # No markdown fence — extract lines starting from first Cypher keyword
+        lines        = raw_query.split('\n')
+        cypher_lines = []
+        started      = False
+        for line in lines:
+            stripped = line.strip()
+            if re.match(
+                r'^(MATCH|OPTIONAL\s+MATCH|WITH|RETURN|WHERE|UNWIND)',
+                stripped, re.IGNORECASE
+            ):
+                started = True
+            if started:
+                # Stop when explanation text begins after the query
+                if stripped.startswith(('-', '*', 'This', 'The query', 'The user')):
+                    break
+                cypher_lines.append(line)
+        query = '\n'.join(cypher_lines).strip() if cypher_lines else raw_query.strip()
+
+    # ── b) Fix spaces inside Neptune function calls ───────────────────
+    function_fixes = [
+        (r'to\s+[Ll]ower\s*\(',                        'toLower('),
+        (r'toLower\s+\(',                               'toLower('),
+        (r'to\s+[Uu]pper\s*\(',                        'toUpper('),
+        (r'labels\s*\(\s*(\w+)\s*\)\s*\[\s*0\s*\]',   r'labels(\1)[0]'),
+        (r'type\s*\(\s*(\w+)\s*\)',                    r'type(\1)'),
+    ]
+    for pattern, replacement in function_fixes:
+        query = re.sub(pattern, replacement, query)
+
+    # ── c) Replace OPTIONAL MATCH with plain MATCH ────────────────────
+    query = re.sub(r'OPTIONAL\s+MATCH', 'MATCH', query, flags=re.IGNORECASE)
+
+    # ── d) Merge two MATCH blocks into one flat MATCH ─────────────────
+    # Handles:
+    #   MATCH (a)
+    #   WHERE cond1
+    #   MATCH (a)-[r]-(b)
+    #   WHERE cond2
+    # →
+    #   MATCH (a)-[r]-(b)
+    #   WHERE cond1
+    #   AND cond2
+    query = re.sub(
+        r'MATCH\s+(\(\w+\))\s*\n\s*WHERE\s+([\s\S]+?)\n\s*MATCH\s+(\(\w+\)-\[[^\]]*\]-\(\w+\))\s*\n\s*WHERE\s+',
+        r'MATCH \3\nWHERE \2\nAND ',
+        query,
+        flags=re.IGNORECASE
+    )
+
+    print(f"\n✅ CLEANED QUERY (sent to Neptune):\n{query}")
+    return query
+
+
+def run_neptune_query(graph, clean_query, question):
+    """
+    Step 3 — Runs the cleaned Cypher query against Neptune.
+    If it still fails, runs a safe broad fallback query.
+
+    The fallback extracts the most meaningful word from the question
+    and searches across all node id and name properties — always valid.
+
+    Args:
+        graph       : NeptuneGraph object from connect_option_b()
+        clean_query : cleaned Cypher string from clean_cypher()
+        question    : original user question (used to build fallback)
+
+    Returns:
+        list : list of result dicts from Neptune, or [] if nothing found
+    """
+    # Try cleaned query first
+    try:
+        raw     = graph.query(clean_query)
+        results = raw if isinstance(raw, list) else raw.get("results", [])
+        print(f"\n📦 NEPTUNE RESULT: {str(results)[:300]}")
+        return results
+
+    except Exception as e:
+        print(f"\n❌ Cleaned query failed: {str(e)[:200]}")
+
+    # Build and run safe fallback
+    stop_words = {
+        "who", "what", "where", "when", "how", "is", "are",
+        "the", "a", "an", "of", "in", "at", "by", "for",
+        "with", "to", "do", "does", "did", "was", "were"
+    }
+    words   = [
+        w.strip("?.,!") for w in question.lower().split()
+        if w.strip("?.,!") not in stop_words and len(w.strip("?.,!")) > 2
+    ]
+    term    = words[0] if words else "a"
+
+    fallback = f"""MATCH (a)-[r]-(b)
+WHERE toLower(a.id) CONTAINS toLower('{term}')
+   OR toLower(a.name) CONTAINS toLower('{term}')
+   OR toLower(b.id) CONTAINS toLower('{term}')
+   OR toLower(b.name) CONTAINS toLower('{term}')
+RETURN a.id AS From, type(r) AS Relationship, b.id AS To
+LIMIT 50"""
+
+    print(f"\n⚙️  Running fallback query:\n{fallback}")
+    try:
+        raw     = graph.query(fallback)
+        results = raw if isinstance(raw, list) else raw.get("results", [])
+        print(f"\n📦 FALLBACK RESULT: {str(results)[:300]}")
+        return results
+    except Exception as fe:
+        print(f"❌ Fallback also failed: {str(fe)[:200]}")
+        return []
+
+
+def generate_answer(llm, question, results):
+    """
+    Step 4 — LLM reads the Neptune results and writes a natural language answer.
+
+    Args:
+        llm      : ChatBedrock instance from get_llm()
+        question : original user question
+        results  : list of result dicts from run_neptune_query()
+
+    Returns:
+        str : natural language answer
+    """
+    if not results:
+        return "No information found in the graph for that question."
+
+    ANSWER_PROMPT = PromptTemplate(
+        input_variables=["question", "context"],
+        template="""Answer the question using only the data provided below.
+Be concise and direct. If the data is empty say "No information found."
+
+Question: {question}
+Data: {context}
+
+Answer:"""
+    )
+
+    chain  = ANSWER_PROMPT | llm | StrOutputParser()
+    answer = chain.invoke({"question": question, "context": str(results)})
+    print(f"\n💬 ANSWER: {answer}")
+    return answer
+
+
+def ask(llm, graph, schema, question):
+    """
+    Master function — calls all 4 steps in sequence.
+
+    Args:
+        llm      : ChatBedrock instance from get_llm()
+        graph    : NeptuneGraph object from connect_option_b()
+        schema   : schema string from get_schema()
+        question : plain English question
+
+    Returns:
+        str : natural language answer
+    """
+    print(f"\n{'═'*55}")
+    print(f"❓ QUESTION: {question}")
+    print(f"{'═'*55}")
+
+    raw_query   = generate_cypher(llm, schema, question)     # Step 1
+    clean_query = clean_cypher(raw_query)                    # Step 2
+    results     = run_neptune_query(graph, clean_query, question)  # Step 3
+    answer      = generate_answer(llm, question, results)    # Step 4
+
+    return answer
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  SECTION 7 — CLEAN (wipe all data — use to reset between test runs)
 # ═══════════════════════════════════════════════════════════════════════
