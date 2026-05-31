@@ -1468,45 +1468,110 @@ def clean_cypher(raw_query):
     return query
 
 
+# def run_neptune_query(graph, clean_query, question):
+#     """
+#     Step 3 — Runs the cleaned Cypher query against Neptune.
+#     If it still fails, runs a safe broad fallback query.
+
+#     The fallback extracts the most meaningful word from the question
+#     and searches across all node id and name properties — always valid.
+
+#     Args:
+#         graph       : NeptuneGraph object from connect_option_b()
+#         clean_query : cleaned Cypher string from clean_cypher()
+#         question    : original user question (used to build fallback)
+
+#     Returns:
+#         list : list of result dicts from Neptune, or [] if nothing found
+#     """
+#     # Try cleaned query first
+#     try:
+#         raw     = graph.query(clean_query)
+#         results = raw if isinstance(raw, list) else raw.get("results", [])
+#         print(f"\n📦 NEPTUNE RESULT: {str(results)[:300]}")
+#         return results
+
+#     except Exception as e:
+#         print(f"\n❌ Cleaned query failed: {str(e)[:200]}")
+
+#     # Build and run safe fallback
+#     stop_words = {
+#         "who", "what", "where", "when", "how", "is", "are",
+#         "the", "a", "an", "of", "in", "at", "by", "for",
+#         "with", "to", "do", "does", "did", "was", "were"
+#     }
+#     words   = [
+#         w.strip("?.,!") for w in question.lower().split()
+#         if w.strip("?.,!") not in stop_words and len(w.strip("?.,!")) > 2
+#     ]
+#     term    = words[0] if words else "a"
+
+#     fallback = f"""MATCH (a)-[r]-(b)
+# WHERE toLower(a.id) CONTAINS toLower('{term}')
+#    OR toLower(a.name) CONTAINS toLower('{term}')
+#    OR toLower(b.id) CONTAINS toLower('{term}')
+#    OR toLower(b.name) CONTAINS toLower('{term}')
+# RETURN a.id AS From, type(r) AS Relationship, b.id AS To
+# LIMIT 50"""
+
+#     print(f"\n⚙️  Running fallback query:\n{fallback}")
+#     try:
+#         raw     = graph.query(fallback)
+#         results = raw if isinstance(raw, list) else raw.get("results", [])
+#         print(f"\n📦 FALLBACK RESULT: {str(results)[:300]}")
+#         return results
+#     except Exception as fe:
+#         print(f"❌ Fallback also failed: {str(fe)[:200]}")
+#         return []
+    
+
 def run_neptune_query(graph, clean_query, question):
     """
-    Step 3 — Runs the cleaned Cypher query against Neptune.
-    If it still fails, runs a safe broad fallback query.
+    Step 3 — Runs cleaned Cypher against Neptune.
 
-    The fallback extracts the most meaningful word from the question
-    and searches across all node id and name properties — always valid.
+    Fix: When results are empty, checks if the entities mentioned
+    in the question actually exist in the graph.
+    - If both exist but no relationship → returns explicit "not related" context
+    - If one or both don't exist      → returns explicit "not found" context
+    - This ensures generate_answer always has meaningful context to work with
 
     Args:
         graph       : NeptuneGraph object from connect_option_b()
         clean_query : cleaned Cypher string from clean_cypher()
-        question    : original user question (used to build fallback)
+        question    : original user question
 
     Returns:
-        list : list of result dicts from Neptune, or [] if nothing found
+        list : result dicts from Neptune, or meaningful context list if empty
     """
-    # Try cleaned query first
+
+    # ── Try the cleaned query ─────────────────────────────────────────
     try:
         raw     = graph.query(clean_query)
         results = raw if isinstance(raw, list) else raw.get("results", [])
         print(f"\n📦 NEPTUNE RESULT: {str(results)[:300]}")
-        return results
+
+        if results:
+            return results
+        # Results empty — fall through to existence check below
 
     except Exception as e:
         print(f"\n❌ Cleaned query failed: {str(e)[:200]}")
 
-    # Build and run safe fallback
-    stop_words = {
-        "who", "what", "where", "when", "how", "is", "are",
-        "the", "a", "an", "of", "in", "at", "by", "for",
-        "with", "to", "do", "does", "did", "was", "were"
-    }
-    words   = [
-        w.strip("?.,!") for w in question.lower().split()
-        if w.strip("?.,!") not in stop_words and len(w.strip("?.,!")) > 2
-    ]
-    term    = words[0] if words else "a"
+        # ── Fallback broad query ──────────────────────────────────────
+        stop_words = {
+            "who", "what", "where", "when", "how", "is", "are",
+            "the", "a", "an", "of", "in", "at", "by", "for",
+            "with", "to", "do", "does", "did", "was", "were",
+            "and", "related", "relation", "between", "neighbors",
+            "neighbor", "friend", "friends"
+        }
+        words = [
+            w.strip("?.,!") for w in question.lower().split()
+            if w.strip("?.,!") not in stop_words and len(w.strip("?.,!")) > 2
+        ]
+        term = words[0] if words else "a"
 
-    fallback = f"""MATCH (a)-[r]-(b)
+        fallback = f"""MATCH (a)-[r]-(b)
 WHERE toLower(a.id) CONTAINS toLower('{term}')
    OR toLower(a.name) CONTAINS toLower('{term}')
    OR toLower(b.id) CONTAINS toLower('{term}')
@@ -1514,20 +1579,111 @@ WHERE toLower(a.id) CONTAINS toLower('{term}')
 RETURN a.id AS From, type(r) AS Relationship, b.id AS To
 LIMIT 50"""
 
-    print(f"\n⚙️  Running fallback query:\n{fallback}")
-    try:
-        raw     = graph.query(fallback)
-        results = raw if isinstance(raw, list) else raw.get("results", [])
-        print(f"\n📦 FALLBACK RESULT: {str(results)[:300]}")
-        return results
-    except Exception as fe:
-        print(f"❌ Fallback also failed: {str(fe)[:200]}")
-        return []
+        print(f"\n⚙️  Running fallback query:\n{fallback}")
+        try:
+            raw     = graph.query(fallback)
+            results = raw if isinstance(raw, list) else raw.get("results", [])
+            print(f"\n📦 FALLBACK RESULT: {str(results)[:300]}")
+            if results:
+                return results
+        except Exception as fe:
+            print(f"❌ Fallback also failed: {str(fe)[:200]}")
 
+    # ── Results are empty — run existence check ───────────────────────
+    # Extract all meaningful words from question as potential entity names
+    print(f"\n🔎 Results empty — running entity existence check...")
+
+    stop_words_exist = {
+        "who", "what", "where", "when", "how", "is", "are", "the",
+        "a", "an", "of", "in", "at", "by", "for", "with", "to",
+        "do", "does", "did", "was", "were", "and", "related",
+        "relation", "between", "neighbors", "neighbor", "friend",
+        "friends", "have", "has", "many", "much"
+    }
+    candidate_entities = [
+        w.strip("?.,!") for w in question.split()
+        if w.strip("?.,!").lower() not in stop_words_exist
+        and len(w.strip("?.,!")) > 2
+    ]
+
+    found_entities = []
+    for entity in candidate_entities:
+        existence_query = f"""MATCH (n)
+WHERE toLower(n.id) CONTAINS toLower('{entity}')
+   OR toLower(n.name) CONTAINS toLower('{entity}')
+RETURN n.id AS NodeID
+LIMIT 1"""
+        try:
+            res = graph.query(existence_query)
+            res = res if isinstance(res, list) else res.get("results", [])
+            if res:
+                found_entities.append(entity)
+                print(f"   ✅ Entity found in graph: '{entity}'")
+            else:
+                print(f"   ❌ Entity NOT in graph  : '{entity}'")
+        except Exception:
+            pass
+
+    # Build meaningful context based on existence check results
+    if len(found_entities) >= 2:
+        context = [{
+            "info": f"Both '{found_entities[0]}' and '{found_entities[1]}' "
+                    f"exist in the graph but have NO direct relationship between them."
+        }]
+    elif len(found_entities) == 1:
+        context = [{
+            "info": f"'{found_entities[0]}' exists in the graph "
+                    f"but no related data was found for the question asked."
+        }]
+    else:
+        context = [{
+            "info": f"None of the entities mentioned in the question "
+                    f"were found in the graph."
+        }]
+
+    print(f"\n📦 EXISTENCE CHECK CONTEXT: {context}")
+    return context
+
+
+# def generate_answer(llm, question, results):
+#     """
+#     Step 4 — LLM reads the Neptune results and writes a natural language answer.
+
+#     Args:
+#         llm      : ChatBedrock instance from get_llm()
+#         question : original user question
+#         results  : list of result dicts from run_neptune_query()
+
+#     Returns:
+#         str : natural language answer
+#     """
+#     if not results:
+#         return "No information found in the graph for that question."
+
+#     ANSWER_PROMPT = PromptTemplate(
+#         input_variables=["question", "context"],
+#         template="""Answer the question using only the data provided below.
+# Be concise and direct. If the data is empty say "No information found."
+
+# Question: {question}
+# Data: {context}
+
+# Answer:"""
+#     )
+
+#     chain  = ANSWER_PROMPT | llm | StrOutputParser()
+#     answer = chain.invoke({"question": question, "context": str(results)})
+#     print(f"\n💬 ANSWER: {answer}")
+#     return answer
 
 def generate_answer(llm, question, results):
     """
-    Step 4 — LLM reads the Neptune results and writes a natural language answer.
+    Step 4 — LLM writes a natural language answer from Neptune results.
+
+    Fix 1: Prompt now explicitly instructs LLM to list EVERY row —
+           no summarising, no skipping.
+    Fix 2: Empty results now return "not related" instead of blank,
+           after verifying both entities exist in the graph.
 
     Args:
         llm      : ChatBedrock instance from get_llm()
@@ -1542,11 +1698,16 @@ def generate_answer(llm, question, results):
 
     ANSWER_PROMPT = PromptTemplate(
         input_variables=["question", "context"],
-        template="""Answer the question using only the data provided below.
-Be concise and direct. If the data is empty say "No information found."
+        template="""Answer the question using ONLY the data provided below.
+
+STRICT RULES:
+1. List EVERY item from the data — never skip or omit any row
+2. If there are multiple rows, mention ALL of them in your answer
+3. Be concise and direct
+4. Do not add information not present in the data
 
 Question: {question}
-Data: {context}
+Data (ALL rows must be included in your answer): {context}
 
 Answer:"""
     )
