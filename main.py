@@ -1743,6 +1743,175 @@ def ask(llm, graph, schema, question):
     return answer
 
 
+def test_chain_invoke_with_custom_prompt(graph, question):
+    """
+    TEST FUNCTION — validates whether custom prompt alone prevents
+    OPTIONAL MATCH and 2-block patterns in NeptuneOpenCypherQAChain.
+
+    This is a controlled test — does NOT affect your working ask() flow.
+    Run this, check the printed intermediate query, and compare with
+    what clean_cypher would have produced.
+
+    Args:
+        graph    : NeptuneGraph object from connect_option_b()
+        question : plain English question to test
+
+    Returns:
+        None — prints all intermediate steps for inspection
+    """
+    from langchain_aws import ChatBedrock
+    from langchain_core.prompts import PromptTemplate
+    from langchain_aws.chains import create_neptune_opencypher_qa_chain
+    from langchain.callbacks.base import BaseCallbackHandler
+
+    # ── Callback to capture generated query BEFORE Neptune runs it ────
+    class QueryCaptureCallback(BaseCallbackHandler):
+        def __init__(self):
+            self.captured_query = "NOT CAPTURED YET"
+
+        def on_llm_end(self, response, **kwargs):
+            try:
+                self.captured_query = response.generations[0][0].text.strip()
+            except Exception:
+                pass
+
+    llm = ChatBedrock(
+        model_id    = config.BEDROCK_MODEL_ID,
+        region_name = config.AWS_REGION
+    )
+
+    # ── Custom prompt — Neptune-specific, no OPTIONAL MATCH ───────────
+    CUSTOM_PROMPT = PromptTemplate(
+        input_variables=["schema", "question"],
+        template="""You are an openCypher expert for Amazon Neptune graph database.
+Generate ONE valid openCypher query for the question below.
+
+Schema:
+{schema}
+
+STRICT NEPTUNE RULES — every rule is mandatory:
+1. ONE flat MATCH clause only — never two MATCH clauses
+2. ALL conditions in ONE WHERE block after ONE MATCH
+3. NEVER use OPTIONAL MATCH — it causes MalformedQueryException in Neptune
+4. Use undirected relationship (a)-[r]-(b) — no arrow direction
+5. Case-insensitive: toLower(n.id) CONTAINS toLower('term')
+6. Search both properties: toLower(n.id) CONTAINS toLower('x') OR toLower(n.name) CONTAINS toLower('x')
+7. No spaces inside functions: toLower() not to Lower() not toLower ()
+8. RETURN property values not node objects: n.id not n
+9. Always end with LIMIT 50
+10. Output ONLY raw Cypher — no explanation, no markdown, no commentary
+
+CORRECT PATTERNS:
+
+Find entity connections:
+MATCH (a)-[r]-(b)
+WHERE (toLower(a.id) CONTAINS toLower('alice') OR toLower(a.name) CONTAINS toLower('alice'))
+RETURN a.id AS From, type(r) AS Relationship, b.id AS To
+LIMIT 50
+
+Find entity + filter by relationship:
+MATCH (a)-[r]-(b)
+WHERE (toLower(a.id) CONTAINS toLower('alice') OR toLower(a.name) CONTAINS toLower('alice'))
+AND toLower(type(r)) CONTAINS toLower('friend')
+RETURN a.id AS From, type(r) AS Relationship, b.id AS To
+LIMIT 50
+
+Find relationship between two entities:
+MATCH (a)-[r]-(b)
+WHERE (toLower(a.id) CONTAINS toLower('alice') OR toLower(a.name) CONTAINS toLower('alice'))
+AND (toLower(b.id) CONTAINS toLower('bob') OR toLower(b.name) CONTAINS toLower('bob'))
+RETURN a.id AS From, type(r) AS Relationship, b.id AS To
+LIMIT 50
+
+WRONG PATTERNS — never generate these:
+MATCH (a)                        <- standalone MATCH with no relationship
+OPTIONAL MATCH (a)-[r]-(b)      <- OPTIONAL MATCH not supported in Neptune
+WHERE condition                  <- WHERE as separate clause after OPTIONAL MATCH
+
+Question: {question}
+Cypher Query:"""
+    )
+
+    chain    = create_neptune_opencypher_qa_chain(
+        llm                       = llm,
+        graph                     = graph,
+        cypher_prompt             = CUSTOM_PROMPT,
+        return_intermediate_steps = True,
+        verbose                   = True
+    )
+
+    callback = QueryCaptureCallback()
+
+    print(f"\n{'═'*60}")
+    print(f"  TEST — chain.invoke() with custom prompt")
+    print(f"  Question: {question}")
+    print(f"{'═'*60}")
+
+    try:
+        response = chain.invoke(
+            {"query": question},
+            config={"callbacks": [callback]}
+        )
+
+        # ── Print captured query (from callback — before Neptune ran it)
+        print(f"\n🤖 CAPTURED QUERY (from LLM, before Neptune):")
+        print(f"{'─'*50}")
+        print(callback.captured_query)
+        print(f"{'─'*50}")
+
+        # ── Print intermediate steps (from chain — after Neptune ran it)
+        if "intermediate_steps" in response:
+            for step in response["intermediate_steps"]:
+                if "query" in step:
+                    print(f"\n✅ QUERY THAT NEPTUNE EXECUTED:")
+                    print(f"{'─'*50}")
+                    print(step["query"].strip())
+                    print(f"{'─'*50}")
+                if "context" in step:
+                    print(f"\n📦 NEPTUNE RESULT:")
+                    print(f"  {str(step['context'])[:300]}")
+
+        print(f"\n💬 ANSWER: {response.get('result', 'No answer')}")
+
+        # ── Compare captured vs executed ──────────────────────────────
+        print(f"\n{'─'*50}")
+        print(f"🔍 COMPARISON:")
+        captured = callback.captured_query
+        executed = ""
+        if "intermediate_steps" in response:
+            for step in response["intermediate_steps"]:
+                if "query" in step:
+                    executed = step["query"].strip()
+
+        if "OPTIONAL MATCH" in captured.upper():
+            print(f"  ⚠️  LLM generated OPTIONAL MATCH — custom prompt NOT sufficient")
+            print(f"  ✅ clean_cypher() is still needed")
+        else:
+            print(f"  ✅ LLM did NOT generate OPTIONAL MATCH — custom prompt worked")
+            print(f"  🤔 Run more questions to confirm consistency")
+
+        if captured.strip() == executed.strip():
+            print(f"  ✅ Captured query = Executed query (no chain modification)")
+        else:
+            print(f"  ⚠️  Chain modified the query before sending to Neptune")
+
+    except Exception as e:
+        print(f"\n❌ chain.invoke() FAILED")
+        print(f"\n🤖 QUERY CAPTURED BEFORE ERROR:")
+        print(f"{'─'*50}")
+        print(callback.captured_query)
+        print(f"{'─'*50}")
+        print(f"\n💥 ERROR: {str(e)[:300]}")
+
+        if "OPTIONAL MATCH" in callback.captured_query.upper():
+            print(f"\n⚠️  OPTIONAL MATCH found in captured query — this caused the error")
+            print(f"✅ Confirms clean_cypher() is needed even with custom prompt")
+        else:
+            print(f"\n🔎 OPTIONAL MATCH not in query — error is from something else")
+
+
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  SECTION 7 — CLEAN (wipe all data — use to reset between test runs)
 # ═══════════════════════════════════════════════════════════════════════
