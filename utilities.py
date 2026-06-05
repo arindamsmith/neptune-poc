@@ -508,3 +508,414 @@ def rectify_missing_data(client_a, graph_documents):
 
 # # If tally doesn't match — rectify
 # rectify_missing_data(client_a, graph_documents)
+
+# Query by ID filter
+def query_by_id(client_a, entity_type, entity_id, depth=1):
+    """
+    Queries Neptune for a specific entity and all its connected nodes
+    up to a given depth. Works for any entity type and ID.
+
+    Args:
+        client_a    : boto3 neptunedata client from connect_option_a()
+        entity_type : node label e.g. 'Patient', 'Claim', 'Doctor'
+        entity_id   : the id value e.g. 'Ravi Sharma', 'CLM001'
+        depth       : how many hops to traverse (default 1)
+                      1 = direct connections only
+                      2 = connections of connections
+
+    Returns:
+        dict : {
+            "entity"        : the matched node properties,
+            "connections"   : list of directly connected nodes,
+            "full_path"     : all nodes and relationships up to depth
+        }
+
+    Usage:
+        query_by_id(client_a, 'Patient', 'Ravi Sharma')
+        query_by_id(client_a, 'Claim',   'CLM001')
+        query_by_id(client_a, 'Doctor',  'Dr. Kapoor', depth=2)
+    """
+
+    def run(cypher):
+        result = client_a.execute_open_cypher_query(openCypherQuery=cypher)
+        return result.get("results", [])
+
+    def display(title, rows):
+        print(f"\n  {'─'*52}")
+        print(f"  {title}")
+        print(f"  {'─'*52}")
+        if not rows:
+            print("  (no results)")
+            return
+        headers = list(rows[0].keys())
+        print("  " + " | ".join(h[:18].ljust(18) for h in headers))
+        print("  " + "─" * (21 * len(headers)))
+        for row in rows:
+            print("  " + " | ".join(
+                str(row.get(h, ""))[:18].ljust(18) for h in headers
+            ))
+        print(f"  {len(rows)} row(s)")
+
+    print(f"\n{'═'*55}")
+    print(f"  QUERY: {entity_type} — '{entity_id}'")
+    print(f"{'═'*55}")
+
+    # ── Q1: Fetch the entity node itself ──────────────────────────────
+    entity_rows = run(f"""
+        MATCH (n:{entity_type})
+        WHERE toLower(n.id)   CONTAINS toLower('{entity_id}')
+           OR toLower(n.name) CONTAINS toLower('{entity_id}')
+        RETURN labels(n)[0] AS Type, n.id AS ID, n.name AS Name,
+               n.status AS Status, n.amount AS Amount,
+               n.age AS Age, n.city AS City,
+               n.specialty AS Specialty, n.filedDate AS FiledDate
+        LIMIT 5
+    """)
+    display(f"{entity_type} Details", entity_rows)
+
+    if not entity_rows:
+        print(f"\n  ❌ No {entity_type} found with id containing '{entity_id}'")
+        return {}
+
+    # ── Q2: All direct connections (depth 1) ─────────────────────────
+    direct_rows = run(f"""
+        MATCH (n:{entity_type})-[r]-(connected)
+        WHERE toLower(n.id)   CONTAINS toLower('{entity_id}')
+           OR toLower(n.name) CONTAINS toLower('{entity_id}')
+        RETURN labels(n)[0]         AS FromType,
+               n.id                 AS From,
+               type(r)              AS Relationship,
+               labels(connected)[0] AS ToType,
+               connected.id         AS To,
+               connected.name       AS ToName,
+               connected.status     AS ToStatus,
+               connected.amount     AS ToAmount
+        ORDER BY type(r)
+        LIMIT 100
+    """)
+    display(f"Direct Connections (depth 1)", direct_rows)
+
+    # ── Q3: Depth 2 — connections of connections ──────────────────────
+    if depth >= 2:
+        depth2_rows = run(f"""
+            MATCH (n:{entity_type})-[r1]-(hop1)-[r2]-(hop2)
+            WHERE (toLower(n.id)   CONTAINS toLower('{entity_id}')
+               OR toLower(n.name)  CONTAINS toLower('{entity_id}'))
+              AND hop2 <> n
+            RETURN labels(hop1)[0] AS Via,
+                   hop1.id         AS ViaID,
+                   type(r2)        AS Relationship,
+                   labels(hop2)[0] AS ToType,
+                   hop2.id         AS To
+            ORDER BY Via
+            LIMIT 100
+        """)
+        display(f"Depth 2 Connections (via intermediaries)", depth2_rows)
+
+    # ── Q4: Relationship type summary ────────────────────────────────
+    summary_rows = run(f"""
+        MATCH (n:{entity_type})-[r]-(connected)
+        WHERE toLower(n.id)   CONTAINS toLower('{entity_id}')
+           OR toLower(n.name) CONTAINS toLower('{entity_id}')
+        RETURN type(r)              AS RelationshipType,
+               labels(connected)[0] AS ConnectedNodeType,
+               count(connected)     AS Count
+        ORDER BY Count DESC
+    """)
+    display(f"Connection Summary", summary_rows)
+
+    return {
+        "entity":      entity_rows,
+        "connections": direct_rows,
+        "summary":     summary_rows
+    }
+
+# Visualize by ID filter
+def visualize_by_id(client_a, entity_type, entity_id,
+                    depth=1, output_file=None):
+    """
+    Visualizes the subgraph around a specific entity using PyVis.
+    Only shows nodes and relationships connected to the given entity.
+
+    Args:
+        client_a    : boto3 neptunedata client from connect_option_a()
+        entity_type : node label e.g. 'Patient', 'Claim', 'Doctor'
+        entity_id   : the id value e.g. 'Ravi Sharma', 'CLM001'
+        depth       : 1 = direct connections, 2 = two hops
+        output_file : HTML filename (auto-generated if None)
+
+    Usage:
+        visualize_by_id(client_a, 'Patient', 'Ravi Sharma')
+        visualize_by_id(client_a, 'Claim',   'CLM001', depth=2)
+        visualize_by_id(client_a, 'Doctor',  'Dr. Kapoor')
+    """
+    from pyvis.network import Network
+    import re
+
+    if output_file is None:
+        safe_id = re.sub(r'[^a-zA-Z0-9]', '_', entity_id)
+        output_file = f"graph_{entity_type}_{safe_id}.html"
+
+    print(f"\n[VISUALIZE] {entity_type} '{entity_id}' "
+          f"(depth={depth}) → {output_file}")
+
+    # ── Fetch the anchor node ─────────────────────────────────────────
+    anchor_result = client_a.execute_open_cypher_query(
+        openCypherQuery=f"""
+            MATCH (n:{entity_type})
+            WHERE toLower(n.id)   CONTAINS toLower('{entity_id}')
+               OR toLower(n.name) CONTAINS toLower('{entity_id}')
+            RETURN id(n) AS node_id, labels(n)[0] AS label, n AS node_obj
+            LIMIT 1
+        """
+    )
+    anchor_rows = anchor_result.get("results", [])
+    if not anchor_rows:
+        print(f"  ❌ No {entity_type} found with id '{entity_id}'")
+        return
+
+    # ── Fetch depth 1: anchor + direct connections ────────────────────
+    depth1_nodes = client_a.execute_open_cypher_query(
+        openCypherQuery=f"""
+            MATCH (n:{entity_type})-[r]-(connected)
+            WHERE toLower(n.id)   CONTAINS toLower('{entity_id}')
+               OR toLower(n.name) CONTAINS toLower('{entity_id}')
+            RETURN id(n)         AS from_id,
+                   labels(n)[0]  AS from_label,
+                   n             AS from_obj,
+                   id(connected) AS to_id,
+                   labels(connected)[0] AS to_label,
+                   connected     AS to_obj,
+                   type(r)       AS rel_type,
+                   id(r)         AS rel_id
+            LIMIT 200
+        """
+    ).get("results", [])
+
+    # ── Fetch depth 2 if requested ────────────────────────────────────
+    depth2_nodes = []
+    if depth >= 2:
+        depth2_nodes = client_a.execute_open_cypher_query(
+            openCypherQuery=f"""
+                MATCH (n:{entity_type})-[r1]-(hop1)-[r2]-(hop2)
+                WHERE (toLower(n.id)   CONTAINS toLower('{entity_id}')
+                   OR toLower(n.name)  CONTAINS toLower('{entity_id}'))
+                  AND hop2 <> n
+                RETURN id(hop1)         AS from_id,
+                       labels(hop1)[0]  AS from_label,
+                       hop1             AS from_obj,
+                       id(hop2)         AS to_id,
+                       labels(hop2)[0]  AS to_label,
+                       hop2             AS to_obj,
+                       type(r2)         AS rel_type,
+                       id(r2)           AS rel_id
+                LIMIT 200
+            """
+        ).get("results", [])
+
+    all_rows = depth1_nodes + depth2_nodes
+
+    if not all_rows:
+        print(f"  ⚠️  Entity found but has no connections.")
+        return
+
+    # ── Colour palette — auto-assigned per label ──────────────────────
+    PALETTE = [
+        "#4A90D9", "#27AE60", "#E74C3C", "#F39C12", "#9B59B6",
+        "#1ABC9C", "#E67E22", "#2ECC71", "#3498DB", "#E91E63",
+    ]
+    all_labels   = sorted({
+        row.get("from_label", "Unknown") for row in all_rows
+    } | {
+        row.get("to_label", "Unknown") for row in all_rows
+    })
+    label_colour = {
+        lbl: PALETTE[i % len(PALETTE)]
+        for i, lbl in enumerate(all_labels)
+    }
+
+    # ── Helper: extract display name from node object ─────────────────
+    def get_display_name(node_obj):
+        if not isinstance(node_obj, dict):
+            return str(node_obj)
+        props = {k: v for k, v in node_obj.items()
+                 if not k.startswith("~") and v is not None}
+        return (props.get("name") or
+                props.get("id")   or
+                props.get("title") or
+                next((str(v) for v in props.values()
+                      if isinstance(v, str)), None) or
+                "unknown")
+
+    def get_tooltip(label, node_obj, node_id):
+        if not isinstance(node_obj, dict):
+            return f"Type: {label}"
+        props = {k: v for k, v in node_obj.items()
+                 if not k.startswith("~") and v is not None}
+        lines = [f"Type    : {label}", f"Int. ID : {node_id}", "─────────"]
+        lines += [f"{k}: {v}" for k, v in props.items()]
+        return "\n".join(lines)
+
+    # ── Build PyVis network ───────────────────────────────────────────
+    net = Network(
+        height     = "820px",
+        width      = "100%",
+        bgcolor    = "#1a1a2e",
+        font_color = "white",
+        notebook   = False
+    )
+    net.barnes_hut(
+        gravity         = -12000,
+        central_gravity = 0.1,
+        spring_length   = 120,
+        spring_strength = 0.04,
+        damping         = 0.95,
+        overlap         = 1
+    )
+
+    added_node_ids = set()
+
+    def add_node(node_id, label, node_obj, is_anchor=False):
+        nid = str(node_id)
+        if nid in added_node_ids:
+            return
+        colour = label_colour.get(label, "#95A5A6")
+        name   = get_display_name(node_obj)
+        tip    = get_tooltip(label, node_obj, nid)
+
+        net.add_node(
+            nid,
+            label       = name,
+            title       = tip,
+            color       = {
+                "background": "#FFD700" if is_anchor else colour,
+                "border":     "#FFFFFF",
+                "highlight":  {
+                    "background": "#FFFFFF",
+                    "border":     "#FFD700" if is_anchor else colour
+                }
+            },
+            size        = 40 if is_anchor else 25,
+            font        = {
+                "size":        16 if is_anchor else 14,
+                "color":       "white",
+                "strokeWidth": 3,
+                "strokeColor": "#000000",
+                "bold":        is_anchor
+            },
+            borderWidth         = 4 if is_anchor else 2,
+            borderWidthSelected = 6,
+            shadow      = True
+        )
+        added_node_ids.add(nid)
+
+    # Add anchor node (highlighted in gold)
+    anchor = anchor_rows[0]
+    add_node(
+        anchor["node_id"],
+        anchor["label"],
+        anchor.get("node_obj", {}),
+        is_anchor=True
+    )
+
+    # Add all connected nodes and edges
+    added_edge_ids = set()
+    for row in all_rows:
+        from_id  = str(row.get("from_id",  ""))
+        to_id    = str(row.get("to_id",    ""))
+        rel_type = str(row.get("rel_type", ""))
+        rel_id   = str(row.get("rel_id",   ""))
+
+        add_node(from_id, row.get("from_label","?"), row.get("from_obj",{}))
+        add_node(to_id,   row.get("to_label","?"),   row.get("to_obj",{}))
+
+        edge_key = f"{from_id}_{rel_type}_{to_id}"
+        if edge_key not in added_edge_ids:
+            net.add_edge(
+                from_id, to_id,
+                label  = rel_type,
+                title  = rel_type,
+                color  = {"color": "#aaaaaa", "highlight": "#ffffff"},
+                arrows = "to",
+                width  = 2,
+                font   = {
+                    "size":        12,
+                    "color":       "#eeeeee",
+                    "strokeWidth": 2,
+                    "strokeColor": "#000000",
+                    "align":       "middle"
+                }
+            )
+            added_edge_ids.add(edge_key)
+
+    # ── Legend ────────────────────────────────────────────────────────
+    net.add_node(
+        "__legend_anchor",
+        label   = f"★ {entity_type} (anchor)",
+        color   = {"background": "#FFD700", "border": "#FFFFFF"},
+        size    = 15,
+        x       = -700, y = -400,
+        physics = False,
+        fixed   = {"x": True, "y": True},
+        font    = {"size": 13, "color": "white",
+                   "strokeWidth": 2, "strokeColor": "#000000"},
+        shape   = "dot"
+    )
+    for i, (lbl, colour) in enumerate(label_colour.items()):
+        net.add_node(
+            f"__legend_{lbl}",
+            label   = lbl,
+            color   = {"background": colour, "border": "#ffffff"},
+            size    = 15,
+            x       = -700, y = -340 + (i * 50),
+            physics = False,
+            fixed   = {"x": True, "y": True},
+            font    = {"size": 13, "color": "white",
+                       "strokeWidth": 2, "strokeColor": "#000000"},
+            shape   = "dot"
+        )
+
+    # ── Options and freeze ────────────────────────────────────────────
+    net.set_options("""
+    {
+      "nodes": { "shape": "dot", "shadow": true },
+      "edges": { "shadow": true, "selectionWidth": 3 },
+      "interaction": {
+        "hover": true,
+        "navigationButtons": true,
+        "tooltipDelay": 80
+      },
+      "physics": {
+        "enabled": true,
+        "barnesHut": {
+          "gravitationalConstant": -12000,
+          "centralGravity": 0.1,
+          "springLength": 120,
+          "springConstant": 0.04,
+          "damping": 0.95,
+          "avoidOverlap": 1
+        },
+        "stabilization": { "enabled": true, "iterations": 300, "fit": true }
+      }
+    }
+    """)
+
+    net.save_graph(output_file)
+
+    # Inject freeze script
+    with open(output_file, "r") as f:
+        html = f.read()
+    freeze = """<script>
+    window.addEventListener("load", function() {
+        network.on("stabilizationIterationsDone", function() {
+            network.setOptions({ physics: { enabled: false } });
+        });
+    });
+    </script>"""
+    html = html.replace("</body>", freeze + "</body>")
+    with open(output_file, "w") as f:
+        f.write(html)
+
+    print(f"  ✅ Saved → {output_file}")
+    print(f"  Nodes : {len(added_node_ids)}  |  Edges : {len(added_edge_ids)}")
+    webbrowser.open(f"file://{os.path.abspath(output_file)}")
