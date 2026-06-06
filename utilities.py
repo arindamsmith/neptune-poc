@@ -919,3 +919,327 @@ def visualize_by_id(client_a, entity_type, entity_id,
     print(f"  ✅ Saved → {output_file}")
     print(f"  Nodes : {len(added_node_ids)}  |  Edges : {len(added_edge_ids)}")
     webbrowser.open(f"file://{os.path.abspath(output_file)}")
+
+
+# Verify whether the written data is present in the graph db along with properties
+def verify(client):
+    """
+    Verifies Neptune graph contents including:
+      - Node counts by type
+      - Relationship counts by type
+      - Node properties actually stored (samples one node per type)
+      - Flags any node type that has no properties written
+    """
+    import json
+
+    print("\n" + "═"*55)
+    print("  [VERIFY] Neptune Graph Contents")
+    print("═"*55)
+
+    # ── Node counts ───────────────────────────────────────────────────
+    node_result = client.execute_open_cypher_query(
+        openCypherQuery="""
+            MATCH (n)
+            RETURN labels(n)[0] AS Type, count(n) AS Count
+            ORDER BY Count DESC
+        """
+    )
+    print("\n  NODE COUNTS:")
+    print(f"  {'Type':<25} {'Count':>8}")
+    print(f"  {'─'*35}")
+    node_count = 0
+    for row in node_result.get("results", []):
+        print(f"  {row.get('Type','?'):<25} {row.get('Count',0):>8}")
+        node_count += row.get("Count", 0)
+    print(f"  {'─'*35}")
+    print(f"  {'TOTAL':<25} {node_count:>8}")
+
+    # ── Relationship counts ───────────────────────────────────────────
+    rel_result = client.execute_open_cypher_query(
+        openCypherQuery="""
+            MATCH ()-[r]->()
+            RETURN type(r) AS Relationship, count(r) AS Count
+            ORDER BY Count DESC
+        """
+    )
+    print("\n  RELATIONSHIP COUNTS:")
+    print(f"  {'Type':<30} {'Count':>8}")
+    print(f"  {'─'*40}")
+    rel_count = 0
+    for row in rel_result.get("results", []):
+        print(f"  {row.get('Relationship','?'):<30} {row.get('Count',0):>8}")
+        rel_count += row.get("Count", 0)
+    print(f"  {'─'*40}")
+    print(f"  {'TOTAL':<30} {rel_count:>8}")
+
+    # ── Property verification — sample one node per type ─────────────
+    print("\n  NODE PROPERTIES (sample per type):")
+    print(f"  {'─'*55}")
+
+    label_result = client.execute_open_cypher_query(
+        openCypherQuery="""
+            MATCH (n)
+            RETURN DISTINCT labels(n)[0] AS label
+            ORDER BY label
+        """
+    )
+    labels = [
+        r["label"]
+        for r in label_result.get("results", [])
+        if r.get("label")
+    ]
+
+    nodes_with_no_props = []
+
+    for label in labels:
+        # Fetch one sample node with all its properties
+        sample_result = client.execute_open_cypher_query(
+            openCypherQuery=f"""
+                MATCH (n:{label})
+                RETURN n.id AS id, keys(n) AS propKeys, n AS node
+                LIMIT 1
+            """
+        )
+        rows = sample_result.get("results", [])
+        if not rows:
+            print(f"\n  [{label}] — no nodes found")
+            continue
+
+        row      = rows[0]
+        node_id  = row.get("id", "unknown")
+        prop_keys = row.get("propKeys", [])
+        node_obj  = row.get("node", {})
+
+        # Remove internal 'id' key from display — always present
+        display_keys = [k for k in prop_keys if k != "id"]
+
+        print(f"\n  [{label}] sample node: '{node_id}'")
+
+        if not display_keys:
+            print(f"    ⚠️  NO PROPERTIES WRITTEN — only 'id' present")
+            nodes_with_no_props.append(label)
+        else:
+            for k in display_keys:
+                # Read actual value from node object
+                val = ""
+                if isinstance(node_obj, dict):
+                    val = node_obj.get(k, "")
+                print(f"    ✅  {k:<20} : {val}")
+
+    # ── Relationship property verification ────────────────────────────
+    print(f"\n  RELATIONSHIP PROPERTIES (sample per type):")
+    print(f"  {'─'*55}")
+
+    rel_type_result = client.execute_open_cypher_query(
+        openCypherQuery="""
+            MATCH ()-[r]->()
+            RETURN DISTINCT type(r) AS relType
+            ORDER BY relType
+        """
+    )
+    rel_types = [
+        r["relType"]
+        for r in rel_type_result.get("results", [])
+        if r.get("relType")
+    ]
+
+    for rel_type in rel_types:
+        sample = client.execute_open_cypher_query(
+            openCypherQuery=f"""
+                MATCH (a)-[r:{rel_type}]->(b)
+                RETURN a.id AS from, b.id AS to,
+                       keys(r) AS propKeys, r AS rel
+                LIMIT 1
+            """
+        )
+        rows = sample.get("results", [])
+        if not rows:
+            continue
+
+        row       = rows[0]
+        from_id   = row.get("from", "?")
+        to_id     = row.get("to",   "?")
+        prop_keys = row.get("propKeys", [])
+        rel_obj   = row.get("rel", {})
+
+        print(f"\n  [{rel_type}] sample: ({from_id})→({to_id})")
+        if not prop_keys:
+            print(f"    (no properties)")
+        else:
+            for k in prop_keys:
+                val = rel_obj.get(k, "") if isinstance(rel_obj, dict) else ""
+                print(f"    ✅  {k:<20} : {val}")
+
+    # ── Summary ───────────────────────────────────────────────────────
+    print(f"\n  {'═'*55}")
+    print(f"  SUMMARY")
+    print(f"  {'═'*55}")
+    print(f"  Total nodes         : {node_count}")
+    print(f"  Total relationships : {rel_count}")
+
+    if nodes_with_no_props:
+        print(f"\n  ⚠️  These node types have NO properties written:")
+        for label in nodes_with_no_props:
+            print(f"    - {label}")
+        print(f"\n  Possible causes:")
+        print(f"    1. LLMGraphTransformer extracted no properties for these types")
+        print(f"    2. write_graph_documents_option_a failed silently on SET clause")
+        print(f"    3. node_properties=True not set on the transformer")
+    else:
+        print(f"\n  ✅ All node types have properties written correctly")
+
+
+# query the graph db and dispaly nodes and relationships along with properties
+def query_neptune(client):
+    """
+    Queries Neptune and prints:
+      - Node type summary (counts)
+      - Relationship type summary (counts)
+      - All nodes with ALL their properties
+      - All connections between nodes
+      - All connections with relationship properties
+    """
+    print("\n[QUERY NEPTUNE] Querying graph contents via boto3...\n")
+
+    # ── Internal helpers ──────────────────────────────────────────────
+
+    def run(cypher):
+        result = client.execute_open_cypher_query(openCypherQuery=cypher)
+        return result.get("results", [])
+
+    def display(title, rows):
+        """Prints any result set as a formatted table."""
+        print(f"  {'─'*60}")
+        print(f"  {title}")
+        print(f"  {'─'*60}")
+        if not rows:
+            print("  (no results)")
+            return
+        headers = list(rows[0].keys())
+        col_w   = 22
+        print("  " + " | ".join(h[:col_w].ljust(col_w) for h in headers))
+        print("  " + "─" * ((col_w + 3) * len(headers)))
+        for row in rows:
+            print("  " + " | ".join(
+                str(row.get(h, ""))[:col_w].ljust(col_w) for h in headers
+            ))
+        print(f"  {len(rows)} row(s)\n")
+
+    def display_nodes_with_properties(label, rows):
+        """
+        Prints each node as a block showing all its properties.
+        Used for Q3 — more readable than a wide flat table
+        when nodes have many properties.
+        """
+        print(f"  {'─'*60}")
+        print(f"  All [{label}] nodes with properties")
+        print(f"  {'─'*60}")
+        if not rows:
+            print("  (no nodes found)")
+            return
+        for row in rows:
+            node_id   = row.get("id", "unknown")
+            node_obj  = row.get("node", {})
+            prop_keys = row.get("propKeys", [])
+
+            print(f"\n  ● id: {node_id}")
+            display_keys = [k for k in prop_keys if k != "id"]
+            if not display_keys:
+                print(f"    (no additional properties)")
+            else:
+                for k in display_keys:
+                    val = node_obj.get(k, "") if isinstance(node_obj, dict) else ""
+                    print(f"    {k:<22} : {val}")
+        print(f"\n  {len(rows)} node(s)\n")
+
+    # ── Q1: Node type summary ─────────────────────────────────────────
+    display(
+        "Q1 — Node Types and Counts",
+        run("""
+            MATCH (n)
+            RETURN labels(n)[0] AS NodeType, count(n) AS Count
+            ORDER BY Count DESC
+        """)
+    )
+
+    # ── Q2: Relationship type summary ─────────────────────────────────
+    display(
+        "Q2 — Relationship Types and Counts",
+        run("""
+            MATCH ()-[r]->()
+            RETURN type(r) AS Relationship, count(r) AS Count
+            ORDER BY Count DESC
+        """)
+    )
+
+    # ── Q3: All nodes with ALL properties — grouped by label ──────────
+    # First get all unique labels
+    label_rows = run("""
+        MATCH (n)
+        RETURN DISTINCT labels(n)[0] AS label
+        ORDER BY label
+    """)
+    labels = [r["label"] for r in label_rows if r.get("label")]
+
+    print(f"  {'─'*60}")
+    print(f"  Q3 — All Nodes with All Properties (grouped by type)")
+    print(f"  {'─'*60}")
+
+    for label in labels:
+        rows = run(f"""
+            MATCH (n:{label})
+            RETURN n.id     AS id,
+                   keys(n)  AS propKeys,
+                   n        AS node
+            ORDER BY n.id
+        """)
+        display_nodes_with_properties(label, rows)
+
+    # ── Q4: All connections ───────────────────────────────────────────
+    display(
+        "Q4 — All Connections (who is connected to whom)",
+        run("""
+            MATCH (a)-[r]->(b)
+            RETURN labels(a)[0] AS FromType,
+                   a.id         AS From,
+                   type(r)      AS Via,
+                   labels(b)[0] AS ToType,
+                   b.id         AS To
+            ORDER BY FromType, From
+            LIMIT 50
+        """)
+    )
+
+    # ── Q5: All connections with relationship properties ──────────────
+    # Only runs if any relationships have properties stored
+    rel_with_props = run("""
+        MATCH (a)-[r]->(b)
+        WHERE size(keys(r)) > 0
+        RETURN a.id    AS From,
+               type(r) AS Via,
+               b.id    AS To,
+               keys(r) AS relPropKeys,
+               r       AS rel
+        LIMIT 50
+    """)
+
+    if rel_with_props:
+        print(f"  {'─'*60}")
+        print(f"  Q5 — Relationships with Properties")
+        print(f"  {'─'*60}")
+        for row in rel_with_props:
+            from_id   = row.get("From",   "?")
+            via       = row.get("Via",    "?")
+            to_id     = row.get("To",     "?")
+            prop_keys = row.get("relPropKeys", [])
+            rel_obj   = row.get("rel", {})
+            print(f"\n  ● ({from_id})-[{via}]→({to_id})")
+            for k in prop_keys:
+                val = rel_obj.get(k, "") if isinstance(rel_obj, dict) else ""
+                print(f"    {k:<22} : {val}")
+        print(f"\n  {len(rel_with_props)} relationship(s) with properties\n")
+    else:
+        print(f"  {'─'*60}")
+        print(f"  Q5 — Relationships with Properties")
+        print(f"  {'─'*60}")
+        print(f"  (no relationship properties found)\n")

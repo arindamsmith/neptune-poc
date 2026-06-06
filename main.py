@@ -1030,14 +1030,21 @@ def verify(client):
     rel_result = client.execute_open_cypher_query(
         openCypherQuery="MATCH ()-[r]->() RETURN type(r) AS Relationship, count(r) AS Count ORDER BY Count DESC"
     )
-
+    print(f"\n\n results - total nodes - {node_result}")
     print("\n  Node counts:")
+    node_count=0
     for row in node_result.get("results", []):
         print(f"    {row.get('Type','?'):<20}: {row.get('Count',0)}")
+        node_count+=row.get('Count',0)
+    print(f"Total node count={node_count}")
 
+    print(f"\n\n results - total Relationship - {rel_result}")
     print("\n  Relationship counts:")
+    rel_count=0
     for row in rel_result.get("results", []):
         print(f"    {row.get('Relationship','?'):<25}: {row.get('Count',0)}")
+        rel_count+=row.get('Count',0)
+    print(f"Total relationship count={rel_count}")
 
 
 def get_nlp_query_chain(graph):
