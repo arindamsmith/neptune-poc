@@ -165,15 +165,51 @@ def write_graph_documents_option_a(client, texts: list):
     for doc in graph_documents:
 
         # Write nodes
+        # for node in doc.nodes:
+        #     props     = node.properties or {}
+        #     props_str = ", ".join(f"n.{k} = '{v}'" for k, v in props.items())
+        #     set_clause = f"SET {props_str}" if props_str else ""
+        #     cypher = f"MERGE (n:{node.type} {{id: '{node.id}'}}) {set_clause}"
+        #     try:
+        #         client.execute_open_cypher_query(openCypherQuery=cypher)
+        #         total_nodes += 1
+        #         print(f"  ✅ Node  : ({node.type} | {node.id})")
+        #     except Exception as e:
+        #         failed_nodes.append(node.id)
+        #         print(f"  ❌ Node FAILED : ({node.type} | {node.id}) → {e}")
+
+        # Write nodes - handle node properties
         for node in doc.nodes:
-            props     = node.properties or {}
-            props_str = ", ".join(f"n.{k} = '{v}'" for k, v in props.items())
-            set_clause = f"SET {props_str}" if props_str else ""
+            import json
+
+            # Clean props — skip None and empty values
+            props = {
+                k: v for k, v in (node.properties or {}).items()
+                if v is not None
+                and str(v).strip() not in ("", "None")
+            }
+
+            if props:
+                set_clause  = "SET " + ", ".join(f"n.{k} = ${k}" for k in props)
+                params_json = json.dumps(props)
+            else:
+                set_clause  = ""
+                params_json = None
+
             cypher = f"MERGE (n:{node.type} {{id: '{node.id}'}}) {set_clause}"
+
             try:
-                client.execute_open_cypher_query(openCypherQuery=cypher)
+                if params_json:
+                    client.execute_open_cypher_query(
+                        openCypherQuery = cypher,
+                        parameters      = params_json
+                    )
+                else:
+                    client.execute_open_cypher_query(
+                        openCypherQuery = cypher
+                    )
                 total_nodes += 1
-                print(f"  ✅ Node  : ({node.type} | {node.id})")
+                print(f"  ✅ Node  : ({node.type} | {node.id}) props={list(props.keys())}")
             except Exception as e:
                 failed_nodes.append(node.id)
                 print(f"  ❌ Node FAILED : ({node.type} | {node.id}) → {e}")
