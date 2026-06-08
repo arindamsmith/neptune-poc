@@ -972,6 +972,104 @@ def verify(client):
     print(f"  {'─'*40}")
     print(f"  {'TOTAL':<30} {rel_count:>8}")
 
+    # # ── Property verification — sample one node per type ───────────── old code not verifying properties correctly
+    # print("\n  NODE PROPERTIES (sample per type):")
+    # print(f"  {'─'*55}")
+
+    # label_result = client.execute_open_cypher_query(
+    #     openCypherQuery="""
+    #         MATCH (n)
+    #         RETURN DISTINCT labels(n)[0] AS label
+    #         ORDER BY label
+    #     """
+    # )
+    # labels = [
+    #     r["label"]
+    #     for r in label_result.get("results", [])
+    #     if r.get("label")
+    # ]
+
+    # nodes_with_no_props = []
+
+    # for label in labels:
+    #     # Fetch one sample node with all its properties
+    #     sample_result = client.execute_open_cypher_query(
+    #         openCypherQuery=f"""
+    #             MATCH (n:{label})
+    #             RETURN n.id AS id, keys(n) AS propKeys, n AS node
+    #             LIMIT 1
+    #         """
+    #     )
+    #     rows = sample_result.get("results", [])
+    #     if not rows:
+    #         print(f"\n  [{label}] — no nodes found")
+    #         continue
+
+    #     row      = rows[0]
+    #     node_id  = row.get("id", "unknown")
+    #     prop_keys = row.get("propKeys", [])
+    #     node_obj  = row.get("node", {})
+
+    #     # Remove internal 'id' key from display — always present
+    #     display_keys = [k for k in prop_keys if k != "id"]
+
+    #     print(f"\n  [{label}] sample node: '{node_id}'")
+
+    #     if not display_keys:
+    #         print(f"    ⚠️  NO PROPERTIES WRITTEN — only 'id' present")
+    #         nodes_with_no_props.append(label)
+    #     else:
+    #         for k in display_keys:
+    #             # Read actual value from node object
+    #             val = ""
+    #             if isinstance(node_obj, dict):
+    #                 val = node_obj.get(k, "")
+    #             print(f"    ✅  {k:<20} : {val}")
+
+    # # ── Relationship property verification ────────────────────────────
+    # print(f"\n  RELATIONSHIP PROPERTIES (sample per type):")
+    # print(f"  {'─'*55}")
+
+    # rel_type_result = client.execute_open_cypher_query(
+    #     openCypherQuery="""
+    #         MATCH ()-[r]->()
+    #         RETURN DISTINCT type(r) AS relType
+    #         ORDER BY relType
+    #     """
+    # )
+    # rel_types = [
+    #     r["relType"]
+    #     for r in rel_type_result.get("results", [])
+    #     if r.get("relType")
+    # ]
+
+    # for rel_type in rel_types:
+    #     sample = client.execute_open_cypher_query(
+    #         openCypherQuery=f"""
+    #             MATCH (a)-[r:{rel_type}]->(b)
+    #             RETURN a.id AS from, b.id AS to,
+    #                    keys(r) AS propKeys, r AS rel
+    #             LIMIT 1
+    #         """
+    #     )
+    #     rows = sample.get("results", [])
+    #     if not rows:
+    #         continue
+
+    #     row       = rows[0]
+    #     from_id   = row.get("from", "?")
+    #     to_id     = row.get("to",   "?")
+    #     prop_keys = row.get("propKeys", [])
+    #     rel_obj   = row.get("rel", {})
+
+    #     print(f"\n  [{rel_type}] sample: ({from_id})→({to_id})")
+    #     if not prop_keys:
+    #         print(f"    (no properties)")
+    #     else:
+    #         for k in prop_keys:
+    #             val = rel_obj.get(k, "") if isinstance(rel_obj, dict) else ""
+    #             print(f"    ✅  {k:<20} : {val}")
+
     # ── Property verification — sample one node per type ─────────────
     print("\n  NODE PROPERTIES (sample per type):")
     print(f"  {'─'*55}")
@@ -992,11 +1090,12 @@ def verify(client):
     nodes_with_no_props = []
 
     for label in labels:
-        # Fetch one sample node with all its properties
+        # ── KEY FIX: use properties(n) which returns flat dict ────────
         sample_result = client.execute_open_cypher_query(
             openCypherQuery=f"""
                 MATCH (n:{label})
-                RETURN n.id AS id, keys(n) AS propKeys, n AS node
+                RETURN n.id          AS id,
+                       properties(n) AS props
                 LIMIT 1
             """
         )
@@ -1005,26 +1104,21 @@ def verify(client):
             print(f"\n  [{label}] — no nodes found")
             continue
 
-        row      = rows[0]
-        node_id  = row.get("id", "unknown")
-        prop_keys = row.get("propKeys", [])
-        node_obj  = row.get("node", {})
+        row     = rows[0]
+        node_id = row.get("id", "unknown")
+        props   = row.get("props", {})    # ← flat dict, no nesting
 
-        # Remove internal 'id' key from display — always present
-        display_keys = [k for k in prop_keys if k != "id"]
+        # Filter out internal id for display
+        display_props = {k: v for k, v in props.items() if k != "id"}
 
         print(f"\n  [{label}] sample node: '{node_id}'")
 
-        if not display_keys:
+        if not display_props:
             print(f"    ⚠️  NO PROPERTIES WRITTEN — only 'id' present")
             nodes_with_no_props.append(label)
         else:
-            for k in display_keys:
-                # Read actual value from node object
-                val = ""
-                if isinstance(node_obj, dict):
-                    val = node_obj.get(k, "")
-                print(f"    ✅  {k:<20} : {val}")
+            for k, v in display_props.items():
+                print(f"    ✅  {k:<20} : {v}")
 
     # ── Relationship property verification ────────────────────────────
     print(f"\n  RELATIONSHIP PROPERTIES (sample per type):")
@@ -1044,11 +1138,13 @@ def verify(client):
     ]
 
     for rel_type in rel_types:
+        # ── Same fix: properties(r) instead of r ─────────────────────
         sample = client.execute_open_cypher_query(
             openCypherQuery=f"""
                 MATCH (a)-[r:{rel_type}]->(b)
-                RETURN a.id AS from, b.id AS to,
-                       keys(r) AS propKeys, r AS rel
+                RETURN a.id          AS fromId,
+                       b.id          AS toId,
+                       properties(r) AS props
                 LIMIT 1
             """
         )
@@ -1056,19 +1152,17 @@ def verify(client):
         if not rows:
             continue
 
-        row       = rows[0]
-        from_id   = row.get("from", "?")
-        to_id     = row.get("to",   "?")
-        prop_keys = row.get("propKeys", [])
-        rel_obj   = row.get("rel", {})
+        row     = rows[0]
+        from_id = row.get("fromId", "?")
+        to_id   = row.get("toId",   "?")
+        props   = row.get("props",  {})    # ← flat dict
 
         print(f"\n  [{rel_type}] sample: ({from_id})→({to_id})")
-        if not prop_keys:
+        if not props:
             print(f"    (no properties)")
         else:
-            for k in prop_keys:
-                val = rel_obj.get(k, "") if isinstance(rel_obj, dict) else ""
-                print(f"    ✅  {k:<20} : {val}")
+            for k, v in props.items():
+                print(f"    ✅  {k:<20} : {v}")
 
     # ── Summary ───────────────────────────────────────────────────────
     print(f"\n  {'═'*55}")
@@ -1173,7 +1267,6 @@ def query_neptune(client):
     )
 
     # ── Q3: All nodes with ALL properties — grouped by label ──────────
-    # First get all unique labels
     label_rows = run("""
         MATCH (n)
         RETURN DISTINCT labels(n)[0] AS label
@@ -1186,14 +1279,25 @@ def query_neptune(client):
     print(f"  {'─'*60}")
 
     for label in labels:
+        # ── KEY FIX: properties(n) returns flat dict ──────────────────
         rows = run(f"""
             MATCH (n:{label})
-            RETURN n.id     AS id,
-                   keys(n)  AS propKeys,
-                   n        AS node
+            RETURN n.id          AS id,
+                   properties(n) AS props
             ORDER BY n.id
         """)
-        display_nodes_with_properties(label, rows)
+        print(f"\n  [{label}] — {len(rows)} node(s)")
+        for row in rows:
+            node_id = row.get("id", "unknown")
+            props   = row.get("props", {})
+            display_props = {k: v for k, v in props.items() if k != "id"}
+
+            print(f"\n  ● id: {node_id}")
+            if not display_props:
+                print(f"    (no additional properties)")
+            else:
+                for k, v in display_props.items():
+                    print(f"    {k:<22} : {v}")
 
     # ── Q4: All connections ───────────────────────────────────────────
     display(
@@ -1211,35 +1315,29 @@ def query_neptune(client):
     )
 
     # ── Q5: All connections with relationship properties ──────────────
-    # Only runs if any relationships have properties stored
     rel_with_props = run("""
         MATCH (a)-[r]->(b)
         WHERE size(keys(r)) > 0
-        RETURN a.id    AS From,
-               type(r) AS Via,
-               b.id    AS To,
-               keys(r) AS relPropKeys,
-               r       AS rel
+        RETURN a.id          AS fromId,
+               type(r)       AS relType,
+               b.id          AS toId,
+               properties(r) AS props
         LIMIT 50
     """)
 
-    if rel_with_props:
-        print(f"  {'─'*60}")
-        print(f"  Q5 — Relationships with Properties")
-        print(f"  {'─'*60}")
-        for row in rel_with_props:
-            from_id   = row.get("From",   "?")
-            via       = row.get("Via",    "?")
-            to_id     = row.get("To",     "?")
-            prop_keys = row.get("relPropKeys", [])
-            rel_obj   = row.get("rel", {})
-            print(f"\n  ● ({from_id})-[{via}]→({to_id})")
-            for k in prop_keys:
-                val = rel_obj.get(k, "") if isinstance(rel_obj, dict) else ""
-                print(f"    {k:<22} : {val}")
-        print(f"\n  {len(rel_with_props)} relationship(s) with properties\n")
-    else:
-        print(f"  {'─'*60}")
-        print(f"  Q5 — Relationships with Properties")
-        print(f"  {'─'*60}")
+    print(f"  {'─'*60}")
+    print(f"  Q5 — Relationships with Properties")
+    print(f"  {'─'*60}")
+    if not rel_with_props:
         print(f"  (no relationship properties found)\n")
+    else:
+        for row in rel_with_props:
+            from_id  = row.get("fromId",  "?")
+            rel_type = row.get("relType", "?")
+            to_id    = row.get("toId",    "?")
+            props    = row.get("props",   {})
+
+            print(f"\n  ● ({from_id})-[{rel_type}]→({to_id})")
+            for k, v in props.items():
+                print(f"    {k:<22} : {v}")
+        print(f"\n  {len(rel_with_props)} relationship(s) with properties\n")
