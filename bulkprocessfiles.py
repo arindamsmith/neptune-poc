@@ -34,9 +34,16 @@ def call_ingestion_api(file_path: str) -> list[dict]:
 
 
 def save_chunks(chunks: list[dict], output_path: str):
-    """Save chunks to a JSON file."""
+    # """Save chunks to a JSON file."""
+    # with open(output_path, "w", encoding="utf-8") as f:
+    #     json.dump(chunks, f, indent=2, ensure_ascii=False)
+    
+    """Save chunks to a TXT file."""
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(chunks, f, indent=2, ensure_ascii=False)
+        for i, chunk in enumerate(chunks, start=1):
+            f.write(f"--- Chunk {i} ---\n")
+            f.write(chunk.get("page_content", "[No page_content found]"))
+            f.write("\n\n")
 
 
 def print_chunks(file_name: str, chunks: list[dict]):
@@ -89,8 +96,9 @@ def process_folder():
             # Print to console
             print_chunks(file_path.name, chunks)
 
-            # Save to individual JSON file
-            output_file_name = f"{file_path.stem}_chunks.json"
+            # Save to individual txt file
+            # output_file_name = f"{file_path.stem}_chunks.json"
+            output_file_name = f"{file_path.stem}_chunks.txt"
             output_path      = os.path.join(OUTPUT_FOLDER, output_file_name)
             save_chunks(chunks, output_path)
 
