@@ -156,3 +156,147 @@ if __name__ == "__main__":
 
     # Step 2 — Uncomment below when you want to combine all into one file
     # combine_all_chunks()
+
+
+    -----------------------------------------------------------------------------------------
+
+    # changes
+
+    import os
+import requests
+import json
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+
+METADATA_API_URL  = os.getenv("METADATA_API_URL")    # 🆕 NEW — GET endpoint for metadata
+INGESTION_API_URL = os.getenv("INGESTION_API_URL")   # 🔶 CHANGED — renamed from API_URL for clarity
+INPUT_FOLDER      = os.getenv("INPUT_FOLDER")
+OUTPUT_FOLDER     = os.getenv("OUTPUT_FOLDER")
+
+CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", 2000))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 200))
+
+ALLOWED_EXTENSIONS = [".pdf"]   # set to None to process all file types
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def get_file_metadata(file_path: str) -> dict:
+    """Step 1 — Call the GET metadata API for a single file and return metadata dict."""
+    params = {"file_path": file_path}
+
+    response = requests.get(METADATA_API_URL, params=params, timeout=30)
+    response.raise_for_status()
+
+    metadata = response.json()
+
+    # 🆕 NEW — print the raw JSON response so you can SEE its shape
+    print(f"\n--- METADATA RESPONSE for {file_path} ---")
+    print(json.dumps(metadata, indent=2))   # 🔶 CHANGED from print(response.json) → this
+
+    return metadata
+
+
+def call_ingestion_api(metadata: dict) -> list[dict]:
+    """
+    Step 2 — Call the data ingestion POST API.
+    🔶 CHANGED — now takes the FULL metadata dict (not just file_path) as input,
+    and merges chunk_size/chunk_overlap into it before sending.
+    """
+    payload = {
+        **metadata,                     # 🆕 NEW — unpack all metadata keys (filename, size, type, file_path, etc.)
+        "chunk_size": CHUNK_SIZE,
+        "chunk_overlap": CHUNK_OVERLAP
+    }
+
+    print(f"\n--- INGESTION PAYLOAD ---")
+    print(json.dumps(payload, indent=2))   # 🆕 NEW — see exactly what's being sent
+
+    response = requests.post(INGESTION_API_URL, json=payload, timeout=120)
+    response.raise_for_status()
+
+    return response.json()
+
+
+def process_folder():
+    """
+    Main flow:
+    loop over files → get metadata (GET) → pass metadata to ingestion (POST) → get chunks
+    """
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    if ALLOWED_EXTENSIONS:
+        all_files = [
+            f for f in Path(INPUT_FOLDER).iterdir()
+            if f.is_file() and f.suffix.lower() in ALLOWED_EXTENSIONS
+        ]
+    else:
+        all_files = [f for f in Path(INPUT_FOLDER).iterdir() if f.is_file()]
+
+    print(f"Found {len(all_files)} file(s) in: {INPUT_FOLDER}")
+
+    if not all_files:
+        print(f"No files found in: {INPUT_FOLDER}")
+        return
+
+    success_count = 0
+    error_count   = 0
+
+    for file_path in all_files:
+        print(f"\n{'='*70}")
+        print(f"Processing: {file_path.name}")
+        print(f"{'='*70}")
+
+        try:
+            # Step 1 — Get metadata for this file
+            metadata = get_file_metadata(str(file_path))   # 🆕 NEW step
+
+            # Step 2 — Pass metadata dict to ingestion API
+            chunks = call_ingestion_api(metadata)           # 🔶 CHANGED — was call_ingestion_api(str(file_path)) before
+
+            # Step 3 — Extract page_content from each chunk
+            extracted_texts = []
+            for chunk in chunks:
+                page_content = chunk.get("page_content", "")
+                if page_content:
+                    extracted_texts.append(page_content)
+
+            print(f"\nTOTAL CHUNKS: {len(extracted_texts)}")
+            for i, text in enumerate(extracted_texts, start=1):
+                print(f"\n--- Chunk {i} ---")
+                print(text)
+
+            # Step 4 — Save to .txt
+            output_file_name = f"{file_path.stem}_chunks.txt"
+            output_path      = os.path.join(OUTPUT_FOLDER, output_file_name)
+
+            with open(output_path, "w", encoding="utf-8") as f:
+                for i, text in enumerate(extracted_texts, start=1):
+                    f.write(f"--- Chunk {i} ---\n")
+                    f.write(text)
+                    f.write("\n\n")
+
+            print(f"\n✅ Saved {len(extracted_texts)} chunks to: {output_path}")
+            success_count += 1
+
+        except requests.exceptions.HTTPError as e:
+            print(f"❌ API error for {file_path.name}: {e}")
+            error_count += 1
+
+        except Exception as e:
+            print(f"❌ Unexpected error for {file_path.name}: {e}")
+            error_count += 1
+
+    print(f"\n{'='*70}")
+    print(f"DONE — {success_count} succeeded, {error_count} failed.")
+    print(f"Output folder: {OUTPUT_FOLDER}")
+    print(f"{'='*70}")
+
+
+if __name__ == "__main__":
+    process_folder()
