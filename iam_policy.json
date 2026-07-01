@@ -1,0 +1,51 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3ReadDocument",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME/*"
+    },
+    {
+      "Sid": "S3Annotations",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObjectAnnotation",
+        "s3:GetObjectAnnotation",
+        "s3:ListObjectAnnotations",
+        "s3:DeleteObjectAnnotation"
+      ],
+      "Resource": "arn:aws:s3:::YOUR-BUCKET-NAME/*"
+    },
+    {
+      "Sid": "ComprehendMedical",
+      "Effect": "Allow",
+      "Action": [
+        "comprehendmedical:DetectEntitiesV2"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DurableExecution",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CheckpointDurableExecution",
+        "lambda:GetDurableExecutionState"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:*:*:*"
+    }
+  ]
+}

@@ -162,7 +162,7 @@ if __name__ == "__main__":
 
     # changes
 
-    import os
+import os
 import requests
 import json
 from pathlib import Path
