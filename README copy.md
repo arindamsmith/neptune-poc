@@ -200,3 +200,19 @@ cat /tmp/entities.json
 3. S3 annotations names must NOT start with `aws` or `s3` (reserved prefixes)
 4. `context.step(...)` calls must use **unique names** — the loop uses `comprehend-chunk-{i}` to ensure this
 5. Do NOT put side effects outside `context.step()` — they'll re-run on every replay
+
+
+## Some info
+1. first list all the annotations with prefix "comprehend_analysis" from the object
+
+i want to collate and aggregate all the comprehend analyzed chunks into a single file so that it will be easier to refer. but as comprehend has the 20k limit, we can't directly analyze the whole file and hence we analyze separate chunks. now that we have all the chunks analyzed and created as annotation to the object, let's read all the annotations and collate into a single file and store it as an object in s3.
+
+2. also the data_ingestion list of chunk that is saved locally is also saved in the s3 bucket as an object
+
+3. take these 2 objects, the comnbined chunks and the combined medical entities and create the context for llm.
+
+4. write the system prompt to use this context to extract meaningful medical summary utilizing the comprehend medical detect entities. this summary will be used by the claims manager. it is a very important summary which will form the basis of the crucial decision made by the claims manager about claims raised.
+
+5. take this summary and store it in dynamo db
+
+i would want to see this first as functional program, as you have been doing now in a .py file. after this code runs fine, i would like to convert all these functions and make it into a langgrpah flow where the nodes will be the function calls as you have done for the previous flow.
